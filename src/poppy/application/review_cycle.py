@@ -72,6 +72,7 @@ class PullRequestSnapshot:
     additions: int
     deletions: int
     files: tuple[ChangedFile, ...]
+    is_complete: bool = True
 
     @property
     def changed_lines(self) -> int:
