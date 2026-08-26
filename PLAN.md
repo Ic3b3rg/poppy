@@ -1,6 +1,7 @@
 # Poppy v0 Implementation Plan
 
-Status: awaiting Operator approval.
+Status: approved by the Operator; Slices 1–3 complete, Slice 4 implemented with the
+authenticated smoke test pending.
 
 ## Constraint
 

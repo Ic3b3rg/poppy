@@ -2,6 +2,7 @@ from typing import Protocol
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from starlette.types import Lifespan
 
 from poppy.application.review_cycle import ReviewRequest
 from poppy.webhook import InvalidWebhook, normalize_pull_request_webhook, verify_signature
@@ -13,8 +14,13 @@ class SchedulerPort(Protocol):
     async def schedule(self, request: ReviewRequest) -> bool: ...
 
 
-def create_app(*, webhook_secret: bytes, scheduler: SchedulerPort) -> FastAPI:
-    app = FastAPI(title="Poppy", docs_url=None, redoc_url=None)
+def create_app(
+    *,
+    webhook_secret: bytes,
+    scheduler: SchedulerPort,
+    lifespan: Lifespan[FastAPI] | None = None,
+) -> FastAPI:
+    app = FastAPI(title="Poppy", docs_url=None, redoc_url=None, lifespan=lifespan)
 
     @app.get("/healthz")
     async def health() -> dict[str, str]:

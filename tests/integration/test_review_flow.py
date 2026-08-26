@@ -13,6 +13,7 @@ from poppy.application.review_cycle import (
     PullRequestSnapshot,
     ReviewCycle,
     ReviewRequest,
+    ReviewUnavailable,
 )
 from poppy.application.scheduler import InMemoryScheduler
 from poppy.domain.review import Finding, GateConclusion, ReviewEvent, ReviewResult, Severity
@@ -80,6 +81,11 @@ class FakeCodex:
     async def review(self, snapshot: PullRequestSnapshot) -> ReviewResult:
         self.snapshots.append(snapshot)
         return self.result
+
+
+class UnavailableCodex:
+    async def review(self, snapshot: PullRequestSnapshot) -> ReviewResult:
+        raise ReviewUnavailable("private diagnostic")
 
 
 @pytest.mark.asyncio
@@ -181,6 +187,33 @@ async def test_stale_review_never_publishes_labels_or_formal_review() -> None:
     assert "replace_poppy_labels" not in event_names
     assert "submit_review" not in event_names
     assert github.events[-1][0:3] == ("finish_check", 77, GateConclusion.ACTION_REQUIRED)
+
+
+@pytest.mark.asyncio
+async def test_unavailable_review_publishes_action_required_without_diagnostic() -> None:
+    snapshot = pull_request_snapshot()
+    github = FakeGitHub([snapshot, snapshot])
+    cycle = ReviewCycle(
+        github=github,
+        codex=UnavailableCodex(),
+        blocking_severity=Severity.HIGH,
+    )
+
+    await cycle.run(review_request())
+
+    assert (
+        "replace_poppy_labels",
+        ("poppy:size/s", "poppy:action-required"),
+    ) in github.events
+    review_event = next(event for event in github.events if event[0] == "submit_review")
+    assert review_event[1:3] == ("head-sha", ReviewEvent.COMMENT)
+    assert "could not complete" in str(review_event[3])
+    assert "private diagnostic" not in str(review_event[3])
+    assert github.events[-1][0:3] == (
+        "finish_check",
+        77,
+        GateConclusion.ACTION_REQUIRED,
+    )
 
 
 @pytest.mark.asyncio

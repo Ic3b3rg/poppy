@@ -124,6 +124,10 @@ class CodexPort(Protocol):
     async def review(self, snapshot: PullRequestSnapshot) -> ReviewResult: ...
 
 
+class ReviewUnavailable(RuntimeError):
+    """The AI boundary could not produce a safe, complete review."""
+
+
 class ReviewCycle:
     def __init__(
         self,
@@ -138,6 +142,7 @@ class ReviewCycle:
 
     async def run(self, request: ReviewRequest) -> None:
         check_run_id = await self._github.start_check(request)
+        snapshot: PullRequestSnapshot | None = None
         try:
             snapshot = await self._github.fetch_pull_request(request.ref)
             if not _matches_request(snapshot, request):
@@ -151,13 +156,17 @@ class ReviewCycle:
                 return
 
             await self._publish(request.ref, check_run_id, snapshot, result)
+        except ReviewUnavailable:
+            if snapshot is None:
+                await self._finish_unavailable(request.ref, check_run_id)
+                return
+            current = await self._github.fetch_pull_request(request.ref)
+            if current.review_fingerprint != snapshot.review_fingerprint:
+                await self._finish_superseded(request.ref, check_run_id)
+                return
+            await self._publish_unavailable(request.ref, check_run_id, snapshot)
         except Exception:
-            await self._github.finish_check(
-                request.ref,
-                check_run_id=check_run_id,
-                conclusion=GateConclusion.ACTION_REQUIRED,
-                summary="Poppy could not complete this review. Retry the webhook delivery.",
-            )
+            await self._finish_unavailable(request.ref, check_run_id)
 
     async def _publish(
         self,
@@ -195,6 +204,49 @@ class ReviewCycle:
             check_run_id=check_run_id,
             conclusion=decision.conclusion,
             summary=body,
+        )
+
+    async def _publish_unavailable(
+        self,
+        ref: PullRequestRef,
+        check_run_id: int,
+        snapshot: PullRequestSnapshot,
+    ) -> None:
+        change_size = classify_change_size(snapshot.changed_lines)
+        body = "\n".join(
+            (
+                "## 🌺 Poppy review",
+                "",
+                f"**Commit:** `{snapshot.head_sha[:7]}`  ",
+                f"**Change size:** {change_size.name} ({snapshot.changed_lines} lines)  ",
+                "**Gate:** Action required",
+                "",
+                "Poppy could not complete this review. Retry the webhook delivery.",
+            )
+        )
+        await self._github.replace_poppy_labels(
+            ref,
+            (change_size.label, GateConclusion.ACTION_REQUIRED.result_label),
+        )
+        await self._github.submit_review(
+            ref,
+            head_sha=snapshot.head_sha,
+            event=ReviewEvent.COMMENT,
+            body=body,
+        )
+        await self._github.finish_check(
+            ref,
+            check_run_id=check_run_id,
+            conclusion=GateConclusion.ACTION_REQUIRED,
+            summary=body,
+        )
+
+    async def _finish_unavailable(self, ref: PullRequestRef, check_run_id: int) -> None:
+        await self._github.finish_check(
+            ref,
+            check_run_id=check_run_id,
+            conclusion=GateConclusion.ACTION_REQUIRED,
+            summary="Poppy could not complete this review. Retry the webhook delivery.",
         )
 
     async def _finish_superseded(self, ref: PullRequestRef, check_run_id: int) -> None:
