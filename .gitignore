@@ -18,3 +18,4 @@ dist/
 .codex/
 auth.json
 *.pem
+secrets/

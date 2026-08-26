@@ -8,10 +8,24 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from poppy.adapters.github import GitHubAdapter
-from poppy.application.review_cycle import PullRequestRef, ReviewRequest
+from poppy.application.review_cycle import GitHubPort, PullRequestRef, ReviewRequest
 from poppy.domain.review import GateConclusion, ReviewEvent
 
 RequestHandler = Callable[[httpx.Request], Coroutine[None, None, httpx.Response]]
+
+
+def test_public_github_boundary_has_no_merge_or_repository_write_operation() -> None:
+    forbidden = {
+        "merge",
+        "merge_pull_request",
+        "close_pull_request",
+        "update_branch",
+        "push",
+        "write_contents",
+    }
+
+    assert forbidden.isdisjoint(dir(GitHubPort))
+    assert forbidden.isdisjoint(dir(GitHubAdapter))
 
 
 @pytest.mark.asyncio

@@ -1,4 +1,5 @@
 import logging
+import stat
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -84,12 +85,19 @@ def _prepare_directories(*, codex_home: Path, workspace: Path) -> tuple[Path, Pa
         raise RuntimeConfigurationError("Codex home and review workspace must be separate")
 
     try:
-        resolved_home.mkdir(parents=True, exist_ok=True, mode=0o700)
-        resolved_home.chmod(0o700)
-        resolved_workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
-        resolved_workspace.chmod(0o700)
+        _prepare_private_directory(resolved_home)
+        _prepare_private_directory(resolved_workspace)
         if any(resolved_workspace.iterdir()):
             raise RuntimeConfigurationError("Codex review workspace must remain empty")
     except OSError as error:
         raise RuntimeConfigurationError("Poppy runtime directories are not usable") from error
     return resolved_home, resolved_workspace
+
+
+def _prepare_private_directory(path: Path) -> None:
+    if path.exists() and not path.is_dir():
+        raise RuntimeConfigurationError("Poppy runtime path is not a directory")
+    if not path.exists():
+        path.mkdir(parents=True, mode=0o700)
+    if stat.S_IMODE(path.stat().st_mode) != 0o700:
+        path.chmod(0o700)

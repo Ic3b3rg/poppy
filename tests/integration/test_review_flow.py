@@ -17,7 +17,7 @@ from poppy.application.review_cycle import (
 )
 from poppy.application.scheduler import InMemoryScheduler
 from poppy.domain.review import Finding, GateConclusion, ReviewEvent, ReviewResult, Severity
-from poppy.http import create_app
+from poppy.http import MAX_WEBHOOK_BYTES, create_app
 
 
 class FakeScheduler:
@@ -112,6 +112,19 @@ async def test_invalid_signature_is_rejected_before_scheduling() -> None:
     response = await post_webhook(app, body, secret=b"wrong-secret")
 
     assert response.status_code == 401
+    assert scheduler.requests == []
+
+
+@pytest.mark.asyncio
+async def test_oversized_webhook_is_rejected_before_scheduling() -> None:
+    secret = b"test-webhook-secret"
+    scheduler = FakeScheduler()
+    app = create_app(webhook_secret=secret, scheduler=scheduler)
+    body = b"x" * (MAX_WEBHOOK_BYTES + 1)
+
+    response = await post_webhook(app, body, secret=secret)
+
+    assert response.status_code == 413
     assert scheduler.requests == []
 
 

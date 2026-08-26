@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -12,6 +13,8 @@ from poppy.domain.review import (
     decide_gate,
     render_review,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,31 +144,46 @@ class ReviewCycle:
         self._blocking_severity = blocking_severity
 
     async def run(self, request: ReviewRequest) -> None:
+        log_context = {
+            "repository_id": request.ref.repository_id,
+            "pull_request": request.ref.number,
+            "head_sha": request.head_sha,
+        }
+        logger.info("review cycle started", extra=log_context)
         check_run_id = await self._github.start_check(request)
         snapshot: PullRequestSnapshot | None = None
         try:
             snapshot = await self._github.fetch_pull_request(request.ref)
             if not _matches_request(snapshot, request):
                 await self._finish_superseded(request.ref, check_run_id)
+                logger.info("review cycle superseded", extra=log_context)
                 return
 
             result = await self._codex.review(snapshot)
             current = await self._github.fetch_pull_request(request.ref)
             if current.review_fingerprint != snapshot.review_fingerprint:
                 await self._finish_superseded(request.ref, check_run_id)
+                logger.info("review cycle superseded", extra=log_context)
                 return
 
-            await self._publish(request.ref, check_run_id, snapshot, result)
+            conclusion = await self._publish(request.ref, check_run_id, snapshot, result)
+            logger.info(
+                "review cycle published",
+                extra={**log_context, "conclusion": conclusion.value},
+            )
         except ReviewUnavailable:
+            logger.warning("review cycle unavailable", extra=log_context)
             if snapshot is None:
                 await self._finish_unavailable(request.ref, check_run_id)
                 return
             current = await self._github.fetch_pull_request(request.ref)
             if current.review_fingerprint != snapshot.review_fingerprint:
                 await self._finish_superseded(request.ref, check_run_id)
+                logger.info("review cycle superseded", extra=log_context)
                 return
             await self._publish_unavailable(request.ref, check_run_id, snapshot)
         except Exception:
+            logger.exception("review cycle failed", extra=log_context)
             await self._finish_unavailable(request.ref, check_run_id)
 
     async def _publish(
@@ -174,7 +192,7 @@ class ReviewCycle:
         check_run_id: int,
         snapshot: PullRequestSnapshot,
         result: ReviewResult,
-    ) -> None:
+    ) -> GateConclusion:
         decision = decide_gate(
             result.findings,
             blocking_severity=self._blocking_severity,
@@ -205,6 +223,7 @@ class ReviewCycle:
             conclusion=decision.conclusion,
             summary=body,
         )
+        return decision.conclusion
 
     async def _publish_unavailable(
         self,

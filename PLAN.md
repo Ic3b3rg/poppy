@@ -1,7 +1,7 @@
 # Poppy v0 Implementation Plan
 
-Status: approved by the Operator; Slices 1–3 complete, Slice 4 implemented with the
-authenticated smoke test pending.
+Status: approved by the Operator; code complete. The authenticated container and
+staging acceptance checks require the Operator's Docker host, GitHub App, and ChatGPT login.
 
 ## Constraint
 

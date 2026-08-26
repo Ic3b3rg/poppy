@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from openai_codex import ApprovalMode, AsyncCodex, Sandbox
 
-from poppy.adapters.codex import CodexAdapter
+from poppy.adapters.codex import MAX_CODEX_OUTPUT_CHARACTERS, CodexAdapter
 from poppy.application.review_cycle import (
     ChangedFile,
     PullRequestRef,
@@ -37,8 +37,10 @@ async def test_review_uses_isolated_read_only_thread_and_maps_valid_json(
             }
         ],
     }
+    turn = MagicMock()
+    turn.run = AsyncMock(return_value=SimpleNamespace(final_response=json.dumps(response)))
     thread = MagicMock()
-    thread.run = AsyncMock(return_value=SimpleNamespace(final_response=json.dumps(response)))
+    thread.turn = AsyncMock(return_value=turn)
     client = MagicMock(spec=AsyncCodex)
     client.thread_start = AsyncMock(return_value=thread)
     adapter = CodexAdapter(
@@ -65,13 +67,14 @@ async def test_review_uses_isolated_read_only_thread_and_maps_valid_json(
     assert start_kwargs["config"] == {"web_search": "disabled"}
     assert "untrusted" in start_kwargs["base_instructions"].lower()
 
-    run_args = thread.run.await_args
-    assert "src/handler.py" in run_args.args[0]
-    assert "@@ -1 +1 @@" in run_args.args[0]
-    assert run_args.kwargs["model"] == "gpt-5.6-luna"
-    assert run_args.kwargs["approval_mode"] is ApprovalMode.deny_all
-    assert run_args.kwargs["sandbox"] is Sandbox.read_only
-    assert run_args.kwargs["output_schema"]["additionalProperties"] is False
+    turn_args = thread.turn.await_args
+    assert "src/handler.py" in turn_args.args[0]
+    assert "@@ -1 +1 @@" in turn_args.args[0]
+    assert turn_args.kwargs["model"] == "gpt-5.6-luna"
+    assert turn_args.kwargs["approval_mode"] is ApprovalMode.deny_all
+    assert turn_args.kwargs["sandbox"] is Sandbox.read_only
+    assert turn_args.kwargs["output_schema"]["additionalProperties"] is False
+    turn.run.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio
@@ -106,8 +109,10 @@ async def test_invalid_codex_output_becomes_review_unavailable(
     tmp_path: Path,
     response: str,
 ) -> None:
+    turn = MagicMock()
+    turn.run = AsyncMock(return_value=SimpleNamespace(final_response=response))
     thread = MagicMock()
-    thread.run = AsyncMock(return_value=SimpleNamespace(final_response=response))
+    thread.turn = AsyncMock(return_value=turn)
     client = MagicMock(spec=AsyncCodex)
     client.thread_start = AsyncMock(return_value=thread)
     adapter = CodexAdapter(client=cast(AsyncCodex, client), workspace=tmp_path)
@@ -122,8 +127,11 @@ async def test_codex_timeout_becomes_review_unavailable(tmp_path: Path) -> None:
         await asyncio.Event().wait()
         raise AssertionError("unreachable")
 
+    turn = MagicMock()
+    turn.run = AsyncMock(side_effect=never_finishes)
+    turn.interrupt = AsyncMock()
     thread = MagicMock()
-    thread.run = AsyncMock(side_effect=never_finishes)
+    thread.turn = AsyncMock(return_value=turn)
     client = MagicMock(spec=AsyncCodex)
     client.thread_start = AsyncMock(return_value=thread)
     adapter = CodexAdapter(
@@ -134,6 +142,8 @@ async def test_codex_timeout_becomes_review_unavailable(tmp_path: Path) -> None:
 
     with pytest.raises(ReviewUnavailable, match="timed out"):
         await adapter.review(pull_request_snapshot())
+
+    turn.interrupt.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio
@@ -149,6 +159,39 @@ async def test_oversized_input_never_reaches_codex(tmp_path: Path) -> None:
         await adapter.review(pull_request_snapshot())
 
     client.thread_start.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_oversized_codex_output_is_rejected(tmp_path: Path) -> None:
+    response = json.dumps(
+        {
+            "summary": "Review summary.",
+            "risk": "low",
+            "findings": [
+                {
+                    "severity": "low",
+                    "title": f"Finding {index}",
+                    "explanation": "x" * 2_000,
+                    "evidence": "y" * 2_000,
+                    "suggested_response": "z" * 2_000,
+                    "file_path": "src/file.py",
+                    "line": 1,
+                }
+                for index in range(20)
+            ],
+        }
+    )
+    assert len(response) > MAX_CODEX_OUTPUT_CHARACTERS
+    turn = MagicMock()
+    turn.run = AsyncMock(return_value=SimpleNamespace(final_response=response))
+    thread = MagicMock()
+    thread.turn = AsyncMock(return_value=turn)
+    client = MagicMock(spec=AsyncCodex)
+    client.thread_start = AsyncMock(return_value=thread)
+    adapter = CodexAdapter(client=cast(AsyncCodex, client), workspace=tmp_path)
+
+    with pytest.raises(ReviewUnavailable, match="invalid"):
+        await adapter.review(pull_request_snapshot())
 
 
 def pull_request_snapshot(*, is_complete: bool = True) -> PullRequestSnapshot:

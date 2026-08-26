@@ -32,8 +32,8 @@ def create_app(
         if content_type != "application/json":
             return JSONResponse({"error": "unsupported content type"}, status_code=415)
 
-        body = await request.body()
-        if len(body) > MAX_WEBHOOK_BYTES:
+        body = await _read_bounded_body(request)
+        if body is None:
             return JSONResponse({"error": "webhook body too large"}, status_code=413)
         if not verify_signature(
             body,
@@ -59,3 +59,20 @@ def create_app(
         return JSONResponse({"status": status}, status_code=202)
 
     return app
+
+
+async def _read_bounded_body(request: Request) -> bytes | None:
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > MAX_WEBHOOK_BYTES:
+                return None
+        except ValueError:
+            pass
+
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > MAX_WEBHOOK_BYTES:
+            return None
+        body.extend(chunk)
+    return bytes(body)
