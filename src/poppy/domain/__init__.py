@@ -1,0 +1,1 @@
+"""Pure review domain rules."""

@@ -1,0 +1,20 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
+__pycache__/
+*.py[cod]
+.coverage
+htmlcov/
+dist/
+*.egg-info/
+
+# Runtime state and credentials
+.poppy/
+.codex/
+auth.json
+*.pem
