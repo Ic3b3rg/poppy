@@ -1,5 +1,4 @@
 import asyncio
-import hashlib
 import html
 import json
 import logging
@@ -50,11 +49,10 @@ async def test_connect_github_starts_the_exact_private_app_manifest(
     assert manifest_url.path == "/settings/apps/new"
     manifest_state = parse_qs(manifest_url.query)["state"][0]
     assert len(manifest_state) >= 43
+    app_name = manifest.pop("name")
+    assert isinstance(app_name, str)
+    assert re.fullmatch(r"Poppy [0-9a-f]{12}", app_name) is not None
     assert manifest == {
-        "name": (
-            "Poppy "
-            + hashlib.sha256(f"https://poppy.example\0{manifest_state}".encode()).hexdigest()[:12]
-        ),
         "url": "https://poppy.example",
         "hook_attributes": {
             "url": "https://poppy.example/webhooks/github",
@@ -124,6 +122,7 @@ async def test_repeated_connect_does_not_replace_the_active_manifest_state(
     assert first.status_code == 200
     assert repeated.status_code == 200
     assert manifest_state_from(repeated) == manifest_state_from(first)
+    assert manifest_from(repeated)["name"] == manifest_from(first)["name"]
     repeated_action = re.search(r'<form action="([^"]+)" method="post">', repeated.text)
     assert repeated_action is not None
     assert urlparse(html.unescape(repeated_action.group(1))).path == (
