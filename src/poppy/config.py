@@ -9,6 +9,7 @@ from poppy.adapters.codex import DEFAULT_MODEL
 from poppy.domain.review import Severity
 
 CONTEXT_OVERHEAD_RESERVE = 40_000
+DEFAULT_GITHUB_PRIVATE_KEY_FILE = Path("/run/secrets/github_app_private_key")
 
 
 @dataclass(frozen=True)
@@ -37,8 +38,6 @@ class PoppySettings(CodexHomeSettings):
 
     data_dir: Path = Path("/var/lib/poppy")
     public_base_url: HttpUrl = HttpUrl("https://localhost")
-    setup_bootstrap_ttl_seconds: int = Field(default=86_400, ge=60, le=604_800)
-    setup_session_ttl_seconds: int = Field(default=604_800, ge=300, le=2_592_000)
     codex_workspace: Path = Path("/var/empty/poppy")
     model: str = Field(default=DEFAULT_MODEL, min_length=1, max_length=100)
     review_language: str = Field(default="Italian", min_length=1, max_length=80)
@@ -60,12 +59,20 @@ class PoppySettings(CodexHomeSettings):
             or value.path not in {"", "/"}
             or value.query is not None
             or value.fragment is not None
+            or value.username is not None
+            or value.password is not None
         ):
             raise ValueError("Public base URL must be a complete HTTPS origin")
         return value
 
     @model_validator(mode="after")
-    def reject_partial_reviewer_credentials(self) -> "PoppySettings":
+    def resolve_reviewer_credentials(self) -> "PoppySettings":
+        if (
+            self.github_app_id is not None
+            and self.github_webhook_secret is not None
+            and self.github_private_key_file is None
+        ):
+            self.github_private_key_file = DEFAULT_GITHUB_PRIVATE_KEY_FILE
         provided = (
             self.github_app_id is not None,
             self.github_private_key_file is not None,

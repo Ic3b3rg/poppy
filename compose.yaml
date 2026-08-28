@@ -5,10 +5,13 @@ services:
     restart: unless-stopped
     init: true
     read_only: true
+    env_file:
+      - path: .env
+        required: false
     environment:
       SERVICE_URL_POPPY_8000: /
       POPPY_PUBLIC_BASE_URL: ${POPPY_PUBLIC_BASE_URL:-${SERVICE_URL_POPPY_8000}}
-      POPPY_DATA_DIR: /var/lib/poppy
+      POPPY_DATA_DIR: /var/lib/poppy/codex
       POPPY_CODEX_HOME: /var/lib/poppy/codex
       POPPY_CODEX_WORKSPACE: /var/empty/poppy
       POPPY_LISTEN_HOST: 0.0.0.0
@@ -16,7 +19,9 @@ services:
     ports:
       - "127.0.0.1:${POPPY_HOST_PORT:-8000}:8000"
     volumes:
-      - poppy_data:/var/lib/poppy
+      - poppy_codex:/var/lib/poppy/codex
+    secrets:
+      - github_app_private_key
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=128m
     cap_drop:
@@ -25,4 +30,8 @@ services:
       - no-new-privileges:true
 
 volumes:
-  poppy_data:
+  poppy_codex:
+
+secrets:
+  github_app_private_key:
+    file: ${POPPY_GITHUB_PRIVATE_KEY_SOURCE:-./.poppy-empty-secret}

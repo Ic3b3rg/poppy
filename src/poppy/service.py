@@ -16,7 +16,12 @@ from poppy.application.scheduler import InMemoryScheduler
 from poppy.codex_runtime import build_codex_config, require_chatgpt_account
 from poppy.config import CONTEXT_OVERHEAD_RESERVE, PoppySettings, read_github_private_key
 from poppy.http import create_app, create_setup_app
-from poppy.setup_session import SetupSessionStore, SetupStateError
+from poppy.setup_session import (
+    BOOTSTRAP_TTL_SECONDS,
+    SESSION_TTL_SECONDS,
+    SetupSessionStore,
+    SetupStateError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,23 +41,24 @@ def create_service(
             data_dir = _prepare_private_directory(settings.data_dir.expanduser().resolve())
             setup_session = SetupSessionStore(
                 data_dir=data_dir,
-                bootstrap_ttl_seconds=settings.setup_bootstrap_ttl_seconds,
-                session_ttl_seconds=settings.setup_session_ttl_seconds,
+                bootstrap_ttl_seconds=BOOTSTRAP_TTL_SECONDS,
+                session_ttl_seconds=SESSION_TTL_SECONDS,
                 clock=clock,
             )
             bootstrap_token = setup_session.initialize()
-        except SetupStateError as error:
+        except (OSError, SetupStateError) as error:
             raise RuntimeConfigurationError("Poppy setup state is not usable") from error
+        public_origin = str(settings.public_base_url).rstrip("/")
         if bootstrap_token is not None:
-            setup_url = f"{str(settings.public_base_url).rstrip('/')}/setup?token={bootstrap_token}"
-            logger.info(
+            setup_url = f"{public_origin}/setup?token={bootstrap_token}"
+            logger.warning(
                 "Poppy Setup Session: %s",
                 setup_url,
                 extra={"event": "setup_bootstrap_created", "setup_url": setup_url},
             )
         return create_setup_app(
             setup_session=setup_session,
-            public_base_url=str(settings.public_base_url),
+            public_base_url=settings.public_base_url,
         )
 
     codex_home, workspace = _prepare_directories(

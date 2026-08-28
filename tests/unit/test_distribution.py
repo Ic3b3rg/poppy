@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import yaml
+
 
 def test_container_is_pinned_and_runs_as_unprivileged_user() -> None:
     dockerfile = Path("Dockerfile").read_text()
@@ -7,25 +9,37 @@ def test_container_is_pinned_and_runs_as_unprivileged_user() -> None:
     assert "python:3.14.7-slim-trixie@sha256:" in dockerfile
     assert "ARG UV_VERSION=0.10.10" in dockerfile
     assert "uv sync --frozen --no-dev --no-editable" in dockerfile
-    assert "chmod 700 /var/lib/poppy /var/empty/poppy" in dockerfile
+    assert "chmod 700 /var/lib/poppy/codex /var/empty/poppy" in dockerfile
     assert "USER poppy" in dockerfile
     assert 'ENTRYPOINT ["poppy"]' in dockerfile
     assert "COPY . " not in dockerfile
 
 
 def test_compose_preserves_private_instance_data_and_hardens_the_container() -> None:
-    compose = Path("compose.yaml").read_text()
+    compose = yaml.safe_load(Path("compose.yaml").read_text())
+    service = compose["services"]["poppy"]
 
-    assert "read_only: true" in compose
-    assert "no-new-privileges:true" in compose
-    assert "cap_drop:\n      - ALL" in compose
-    assert "poppy_data:/var/lib/poppy" in compose
-    assert "SERVICE_URL_POPPY_8000: /" in compose
-    assert "POPPY_PUBLIC_BASE_URL: ${POPPY_PUBLIC_BASE_URL:-${SERVICE_URL_POPPY_8000}}" in compose
-    assert "env_file:" not in compose
-    assert "secrets:" not in compose
-    assert "127.0.0.1:${POPPY_HOST_PORT:-8000}:8000" in compose
-    assert "/tmp:rw,noexec,nosuid,size=128m" in compose
+    assert service["read_only"] is True
+    assert service["security_opt"] == ["no-new-privileges:true"]
+    assert service["cap_drop"] == ["ALL"]
+    assert service["volumes"] == ["poppy_codex:/var/lib/poppy/codex"]
+    assert compose["volumes"] == {"poppy_codex": None}
+    assert service["secrets"] == ["github_app_private_key"]
+    assert compose["secrets"] == {
+        "github_app_private_key": {
+            "file": "${POPPY_GITHUB_PRIVATE_KEY_SOURCE:-./.poppy-empty-secret}"
+        }
+    }
+    assert Path(".poppy-empty-secret").read_bytes() == b""
+    assert service["environment"]["SERVICE_URL_POPPY_8000"] == "/"
+    assert service["environment"]["POPPY_PUBLIC_BASE_URL"] == (
+        "${POPPY_PUBLIC_BASE_URL:-${SERVICE_URL_POPPY_8000}}"
+    )
+    assert service["environment"]["POPPY_DATA_DIR"] == "/var/lib/poppy/codex"
+    assert service["environment"]["POPPY_CODEX_HOME"] == "/var/lib/poppy/codex"
+    assert service["env_file"] == [{"path": ".env", "required": False}]
+    assert service["ports"] == ["127.0.0.1:${POPPY_HOST_PORT:-8000}:8000"]
+    assert service["tmpfs"] == ["/tmp:rw,noexec,nosuid,size=128m"]
 
 
 def test_build_context_excludes_credentials_and_local_state() -> None:
@@ -39,8 +53,12 @@ def test_build_context_excludes_credentials_and_local_state() -> None:
 
 
 def test_example_environment_starts_without_integration_credentials() -> None:
-    environment = Path(".env.example").read_text()
+    environment = dict(
+        line.split("=", maxsplit=1)
+        for line in Path(".env.example").read_text().splitlines()
+        if line and not line.startswith("#")
+    )
 
-    assert "POPPY_PUBLIC_BASE_URL=" in environment
+    assert "POPPY_PUBLIC_BASE_URL" in environment
     assert "POPPY_GITHUB_APP_ID" not in environment
     assert "POPPY_GITHUB_WEBHOOK_SECRET" not in environment

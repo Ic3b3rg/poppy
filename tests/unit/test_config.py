@@ -57,6 +57,7 @@ def test_private_key_must_be_a_readable_file(tmp_path: Path) -> None:
         "https://poppy.example/nested",
         "https://poppy.example/?query=value",
         "https://poppy.example/#fragment",
+        "https://operator:secret@poppy.example",
     ],
 )
 def test_public_base_url_is_a_complete_https_origin(public_base_url: str) -> None:
@@ -77,3 +78,16 @@ def test_empty_portable_url_falls_back_when_coolify_magic_is_absent(
 def test_partial_legacy_reviewer_credentials_are_rejected() -> None:
     with pytest.raises(ValidationError, match="configured together"):
         PoppySettings(github_app_id=123, _env_file=None)
+
+
+def test_legacy_reviewer_credentials_reuse_the_compose_pem_location() -> None:
+    settings = PoppySettings(
+        github_app_id=123,
+        github_webhook_secret=SecretStr("a-secret-that-is-long-enough"),
+        _env_file=None,
+    )
+
+    credentials = settings.reviewer_credentials()
+
+    assert credentials is not None
+    assert credentials.private_key_file == Path("/run/secrets/github_app_private_key")

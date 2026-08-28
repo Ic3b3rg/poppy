@@ -36,7 +36,9 @@ GitHub and OpenAI.
 Poppy can boot before GitHub or ChatGPT is connected. On an empty private data volume it starts in
 setup mode, generates one secret bootstrap link, and writes that complete link to the deployment
 log. Opening the link exchanges its one-time query token for a Secure, HttpOnly, SameSite Setup
-Session cookie and redirects to `/setup`, removing the token from the visible address.
+Session cookie and redirects to `/setup`, removing the token from the visible address. Until that
+cookie first reaches the protected page, an interrupted exchange can be recovered after restart
+from a newly logged one-time link; previously logged links remain invalid.
 
 For a portable Docker Compose deployment, configure the public HTTPS origin:
 
@@ -55,9 +57,11 @@ HTTPS domain routed to port `8000`. The Compose definition declares Coolify's
 `SERVICE_URL_POPPY_8000` value and uses it as Poppy's public origin; `POPPY_PUBLIC_BASE_URL`
 remains the explicit override for other hosts.
 
-The `poppy_data` volume is the sole durable store. Setup state is atomically persisted there with
-restrictive permissions and survives container replacement. The container root filesystem stays
-read-only; only that volume and the bounded `/tmp` tmpfs are writable.
+The existing `poppy_codex` volume is the sole durable store. Setup state is atomically persisted
+there with restrictive permissions and survives container replacement alongside any existing
+Codex login. The container root filesystem stays read-only; only that volume and the bounded
+`/tmp` tmpfs are writable. The optional Compose secret uses an empty source on fresh deployments,
+so a PEM is not required to enter setup mode.
 
 A healthy fresh instance answers `GET /healthz` with `{"status":"ok","mode":"setup"}`. Review
 webhooks return `503 Service Unavailable` until onboarding is complete. The GitHub and ChatGPT
@@ -72,8 +76,17 @@ docker compose stop
 docker compose start
 ```
 
-The protected Setup Session and any partial setup state remain in `poppy_data` across these
-operations. A bootstrap link is logged only when that volume is fresh.
+The protected Setup Session and any partial setup state remain in `poppy_codex` across these
+operations. A link is logged for a fresh volume, and a distinct recovery link is logged after a
+restart only when the cookie handoff was not yet confirmed.
+
+An existing pre-onboarding reviewer keeps its `.env`, `secrets/github-app.pem`, and
+`poppy_codex` volume. Before its first `docker compose up` on this version, add this Compose-only
+source path to the existing `.env` so the old PEM is mounted at the same in-container secret path:
+
+```dotenv
+POPPY_GITHUB_PRIVATE_KEY_SOURCE=./secrets/github-app.pem
+```
 
 To update Poppy:
 
@@ -110,6 +123,13 @@ uv run pytest
 uv run mypy src
 uv run ruff check .
 uv run ruff format --check .
+```
+
+With Docker available, validate the resolved Compose model and opt into the networked production
+image build and real setup-mode health check with:
+
+```bash
+uv run pytest -m container tests/integration/test_container_runtime.py
 ```
 
 Normal tests are offline and never call GitHub or consume ChatGPT usage.

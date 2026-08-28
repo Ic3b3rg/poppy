@@ -1,10 +1,12 @@
 import html
 import logging
 from typing import Protocol
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from pydantic import HttpUrl
+from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import Response
 from starlette.types import Lifespan
 
@@ -52,34 +54,36 @@ class SchedulerPort(Protocol):
 def create_setup_app(
     *,
     setup_session: SetupSessionStore,
-    public_base_url: str,
+    public_base_url: HttpUrl,
     lifespan: Lifespan[FastAPI] | None = None,
 ) -> FastAPI:
     app = _create_base_app(mode="setup", lifespan=lifespan)
-    parsed_base_url = urlsplit(public_base_url)
-    expected_origin = f"{parsed_base_url.scheme}://{parsed_base_url.netloc}"
+    expected_origin = str(public_base_url).rstrip("/")
 
     @app.middleware("http")
-    async def protect_setup_mutations(request: Request, call_next: object) -> Response:
+    async def protect_setup_mutations(
+        request: Request,
+        call_next: RequestResponseEndpoint,
+    ) -> Response:
         try:
             is_setup_route = request.url.path == "/setup" or request.url.path.startswith("/setup/")
             if is_setup_route and request.method not in {"GET", "HEAD", "OPTIONS"}:
                 session_token = request.cookies.get(SETUP_SESSION_COOKIE)
-                csrf_token = await _setup_form_csrf_token(request)
-                if (
-                    request.headers.get("origin") != expected_origin
-                    or session_token is None
-                    or csrf_token is None
-                    or not setup_session.mutation_is_authorized(
-                        session_token=session_token,
-                        csrf_token=csrf_token,
+                if request.headers.get("origin") != expected_origin or session_token is None:
+                    return _protect_setup_response(
+                        JSONResponse({"error": "not found"}, status_code=404)
                     )
+
+                csrf_token = await _setup_form_csrf_token(request)
+                if csrf_token is None or not setup_session.mutation_is_authorized(
+                    session_token=session_token,
+                    csrf_token=csrf_token,
                 ):
                     return _protect_setup_response(
                         JSONResponse({"error": "not found"}, status_code=404)
                     )
 
-            response = await call_next(request)  # type: ignore[operator]
+            response = await call_next(request)
             return _protect_setup_response(response)
         except SetupStateError:
             logger.exception(
@@ -96,7 +100,7 @@ def create_setup_app(
         if token is None:
             session_token = request.cookies.get(SETUP_SESSION_COOKIE)
             csrf_token = (
-                setup_session.csrf_token_for(session_token) if session_token is not None else None
+                setup_session.confirm_session(session_token) if session_token is not None else None
             )
             if session_token is None or csrf_token is None:
                 unavailable_response = JSONResponse({"error": "not found"}, status_code=404)
@@ -140,15 +144,8 @@ async def _setup_form_csrf_token(request: Request) -> str | None:
     if content_type != "application/x-www-form-urlencoded":
         return request.headers.get("x-poppy-csrf-token")
 
-    content_length = request.headers.get("content-length")
-    if content_length is not None:
-        try:
-            if int(content_length) > MAX_SETUP_FORM_BYTES:
-                return None
-        except ValueError:
-            return None
-    body = await request.body()
-    if len(body) > MAX_SETUP_FORM_BYTES:
+    body = await _read_bounded_body(request, max_bytes=MAX_SETUP_FORM_BYTES)
+    if body is None:
         return None
     try:
         values = parse_qs(
@@ -189,7 +186,7 @@ def create_app(
         if content_type != "application/json":
             return JSONResponse({"error": "unsupported content type"}, status_code=415)
 
-        body = await _read_bounded_body(request)
+        body = await _read_bounded_body(request, max_bytes=MAX_WEBHOOK_BYTES)
         if body is None:
             return JSONResponse({"error": "webhook body too large"}, status_code=413)
         if not verify_signature(
@@ -228,18 +225,21 @@ def _create_base_app(*, mode: str, lifespan: Lifespan[FastAPI] | None) -> FastAP
     return app
 
 
-async def _read_bounded_body(request: Request) -> bytes | None:
+async def _read_bounded_body(request: Request, *, max_bytes: int) -> bytes | None:
     content_length = request.headers.get("content-length")
     if content_length is not None:
         try:
-            if int(content_length) > MAX_WEBHOOK_BYTES:
+            parsed_content_length = int(content_length)
+            if parsed_content_length < 0 or parsed_content_length > max_bytes:
                 return None
         except ValueError:
-            pass
+            return None
 
     body = bytearray()
     async for chunk in request.stream():
-        if len(body) + len(chunk) > MAX_WEBHOOK_BYTES:
+        if len(body) + len(chunk) > max_bytes:
             return None
         body.extend(chunk)
-    return bytes(body)
+    bounded_body = bytes(body)
+    request._body = bounded_body
+    return bounded_body
