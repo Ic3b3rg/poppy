@@ -112,6 +112,36 @@ The protocol behavior follows GitHub's current documentation:
 - [Generating a JSON Web Token for a GitHub App](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-json-web-token-jwt-for-a-github-app)
 - [Deleting an unused GitHub App](https://docs.github.com/en/apps/maintaining-github-apps/deleting-a-github-app)
 
+### Connect the ChatGPT subscription
+
+From the same protected `/setup` page, **Connect ChatGPT** starts Codex App Server's managed
+ChatGPT device-code flow. Open the displayed OpenAI verification URL, sign in with the Operator's
+ChatGPT account, and enter the temporary user code. The page refreshes while authorization is
+pending and then reports success or a sanitized failure. A pending attempt can be cancelled;
+failed and cancelled attempts can be retried without starting more than one active attempt.
+
+Poppy accepts only a managed ChatGPT account. It forces Codex's ChatGPT login mode, clears the
+`OPENAI_API_KEY` environment variable for the App Server, and rejects and logs out any non-ChatGPT
+account returned at the boundary. For the ChatGPT flow, setup responses expose only status plus
+the temporary verification URL and user code, while normal logs expose only sanitized status—never
+the login ID, account details, access token, or refresh token.
+
+Codex owns token persistence and refresh. Poppy forces file-backed credential storage so Codex
+writes `auth.json` beneath `POPPY_CODEX_HOME`, which is the existing private `poppy_codex` volume.
+Poppy writes only non-credential setup status to `chatgpt-setup.json`. A completed connection
+survives container replacement; an interrupted pending attempt resumes as failed and retryable,
+and the mere presence of a partial `auth.json` is never treated as connected.
+
+GitHub and ChatGPT remain independent setup steps: either can be connected first. Completing this
+step does not by itself activate reviewer mode or close the Setup Session; final readiness is a
+separate onboarding slice.
+
+The authentication behavior follows OpenAI's current documentation:
+
+- [Codex App Server authentication endpoints](https://learn.chatgpt.com/docs/app-server#auth-endpoints)
+- [Login on headless devices](https://learn.chatgpt.com/docs/auth#login-on-headless-devices)
+- [Codex credential storage](https://learn.chatgpt.com/docs/auth#credential-storage)
+
 ## Start, stop, and update
 
 Turn Poppy off and on whenever you want:
