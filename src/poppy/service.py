@@ -49,6 +49,7 @@ def create_service(
                 clock=clock,
             )
             github_setup = GitHubSetupStore(data_dir=data_dir)
+            github_setup.initialize()
             bootstrap_token = setup_session.initialize()
         except (OSError, SetupStateError) as error:
             raise RuntimeConfigurationError("Poppy setup state is not usable") from error
@@ -64,7 +65,7 @@ def create_service(
             base_url="https://api.github.com",
             timeout=httpx.Timeout(30, connect=10),
         )
-        github_onboarding = GitHubOnboarding(client=setup_github_client)
+        github_onboarding = GitHubOnboarding(client=setup_github_client, clock=clock)
 
         @asynccontextmanager
         async def setup_lifespan(_app: FastAPI) -> AsyncIterator[None]:

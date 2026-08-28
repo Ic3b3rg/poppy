@@ -1,6 +1,7 @@
 import html
 import json
 import logging
+import re
 import secrets
 from typing import Protocol
 from urllib.parse import parse_qs, urlencode
@@ -14,7 +15,12 @@ from starlette.types import Lifespan
 
 from poppy.adapters.github_onboarding import GitHubOnboarding, GitHubOnboardingError
 from poppy.application.review_cycle import ReviewRequest
-from poppy.github_setup import GitHubSetupStore, github_app_manifest, installation_url
+from poppy.github_setup import (
+    GitHubSetupStore,
+    GitHubSetupView,
+    github_app_manifest,
+    installation_url,
+)
 from poppy.setup_session import SetupSessionStore, SetupStateError
 from poppy.webhook import InvalidWebhook, normalize_pull_request_webhook, verify_signature
 
@@ -40,13 +46,7 @@ SETUP_PAGE = """<!doctype html>
       <h2 id="connections-heading">Connections</h2>
       <dl>
         <dt>GitHub</dt>
-        <dd>
-          Not connected
-          <form action="/setup/github/connect" method="post">
-            <input type="hidden" name="csrf_token" value="{csrf_token}">
-            <button type="submit">Connect GitHub</button>
-          </form>
-        </dd>
+        <dd>{github_connection}</dd>
         <dt>ChatGPT</dt>
         <dd>Not connected</dd>
       </dl>
@@ -145,7 +145,13 @@ def create_setup_app(
                         samesite="strict",
                     )
                 return _protect_setup_response(unavailable_response)
-            page = SETUP_PAGE.format(csrf_token=html.escape(csrf_token, quote=True))
+            page = SETUP_PAGE.format(
+                csrf_token=html.escape(csrf_token, quote=True),
+                github_connection=_github_connection_html(
+                    github_setup.view(),
+                    csrf_token=csrf_token,
+                ),
+            )
             return _protect_setup_response(HTMLResponse(page))
 
         grant = setup_session.exchange_bootstrap(token)
@@ -169,7 +175,12 @@ def create_setup_app(
         return JSONResponse({"error": "reviewer unavailable"}, status_code=503)
 
     @app.post("/setup/github/connect")
-    async def connect_github() -> HTMLResponse:
+    async def connect_github() -> Response:
+        view = github_setup.view()
+        if view.status == "connected":
+            return JSONResponse({"error": "GitHub is already connected"}, status_code=409)
+        if view.pending is not None:
+            return RedirectResponse(installation_url(view.pending), status_code=303)
         correlation_state = github_setup.begin_manifest()
         action = "https://github.com/settings/apps/new?" + urlencode({"state": correlation_state})
         manifest = json.dumps(
@@ -215,12 +226,72 @@ def create_setup_app(
         pending = github_setup.await_installation(app_credentials)
         return RedirectResponse(installation_url(pending), status_code=303)
 
+    @app.get("/setup/github/installation")
+    async def github_installation_callback(request: Request) -> Response:
+        installation_id = _positive_decimal_query_parameter(request, "installation_id")
+        correlation_state = _single_query_parameter(request, "state")
+        pending = (
+            github_setup.consume_installation(correlation_state)
+            if correlation_state is not None and installation_id is not None
+            else None
+        )
+        if pending is None or installation_id is None:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        try:
+            installation = await github_onboarding.get_installation(
+                app=pending.app,
+                installation_id=installation_id,
+            )
+        except GitHubOnboardingError:
+            logger.warning(
+                "GitHub App installation validation failed",
+                extra={"event": "github_installation_validation_failed"},
+            )
+            return JSONResponse(
+                {"error": "GitHub App installation could not be validated; retry from setup"},
+                status_code=502,
+            )
+        if not github_setup.connect(pending=pending, installation=installation):
+            return JSONResponse(
+                {"error": "GitHub App installation validation became stale"},
+                status_code=409,
+            )
+        return RedirectResponse("/setup", status_code=303)
+
     return app
 
 
 def _single_query_parameter(request: Request, name: str) -> str | None:
     values = request.query_params.getlist(name)
     return values[0] if len(values) == 1 and values[0] else None
+
+
+def _positive_decimal_query_parameter(request: Request, name: str) -> int | None:
+    value = _single_query_parameter(request, name)
+    if value is None or re.fullmatch(r"[1-9][0-9]*", value) is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _github_connection_html(view: GitHubSetupView, *, csrf_token: str) -> str:
+    if view.status == "connected":
+        return "Connected"
+    if view.pending is not None:
+        return (
+            "Awaiting installation. "
+            f'<a href="{html.escape(installation_url(view.pending), quote=True)}">'
+            "Continue on GitHub</a>"
+        )
+    return (
+        "Not connected"
+        '<form action="/setup/github/connect" method="post">'
+        f'<input type="hidden" name="csrf_token" value="{html.escape(csrf_token, quote=True)}">'
+        '<button type="submit">Connect GitHub</button>'
+        "</form>"
+    )
 
 
 async def _setup_form_csrf_token(request: Request) -> str | None:
