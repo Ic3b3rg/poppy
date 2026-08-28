@@ -448,6 +448,41 @@ async def test_ready_marker_with_corrupt_integration_state_serves_unavailable(
     assert provider_detail not in caplog.text
 
 
+@pytest.mark.asyncio
+async def test_ready_instance_canonicalizes_relative_codex_home_without_preparing_it(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured = setup_settings(tmp_path)
+    private_key = github_private_key()
+    seed_ready_state(
+        configured.data_dir,
+        private_key=private_key,
+        webhook_secret="generated-webhook-secret",
+    )
+    monkeypatch.chdir(tmp_path)
+    configured.codex_home = Path("relative-codex-home")
+    codex_factory = MagicMock(return_value=MagicMock())
+    monkeypatch.setattr(service_module, "AsyncCodex", codex_factory)
+    caplog.set_level(logging.WARNING, logger="poppy.service")
+
+    async with github_provider(
+        private_key=private_key,
+        webhook_secret="generated-webhook-secret",
+    ) as provider:
+        create_service(
+            configured,
+            github_onboarding_client=provider,
+            reviewer_adapter_factory=FakeReviewerAdapterFactory(),
+        )
+
+    codex_config = codex_factory.call_args.args[0]
+    assert codex_config.cwd == str(tmp_path / "relative-codex-home")
+    assert not (tmp_path / "relative-codex-home").exists()
+    assert "Poppy Setup Session" not in caplog.text
+
+
 def test_symlinked_readiness_state_fails_closed_without_touching_target(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,

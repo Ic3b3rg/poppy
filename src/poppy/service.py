@@ -196,7 +196,7 @@ def _create_onboarding_service(
         github_setup = GitHubSetupStore(data_dir=data_dir)
         chatgpt_store = ChatGPTSetupStore(data_dir=data_dir)
         if initially_ready:
-            codex_home = settings.codex_home.expanduser()
+            codex_home = settings.codex_home.expanduser().resolve()
             bootstrap_token = None
         else:
             github_setup.initialize()
