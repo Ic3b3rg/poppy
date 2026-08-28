@@ -263,6 +263,31 @@ async def test_promotion_waits_for_an_admitted_setup_response_to_finish(
 
 
 @pytest.mark.asyncio
+async def test_setup_gate_releases_after_a_downstream_exception(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="poppy.service")
+    app = create_service(
+        setup_settings(tmp_path),
+        codex_onboarding=FakeCodexOnboarding(),
+        reviewer_adapter_factory=FakeReviewerAdapterFactory(),
+    )
+
+    @app.get("/setup/fails")
+    async def failing_setup_request() -> None:
+        raise RuntimeError("synthetic downstream failure")
+
+    async with app.router.lifespan_context(app), setup_client(app) as client:
+        await establish_setup_session(client, setup_url_from(caplog))
+        with pytest.raises(RuntimeError, match="synthetic downstream failure"):
+            await client.get("/setup/fails")
+        setup_after_failure = await client.get("/setup")
+
+    assert setup_after_failure.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_transient_runtime_failure_retries_from_the_live_setup_page(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
