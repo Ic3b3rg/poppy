@@ -1,7 +1,9 @@
 import html
+import json
 import logging
+import secrets
 from typing import Protocol
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlencode
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -11,6 +13,7 @@ from starlette.responses import Response
 from starlette.types import Lifespan
 
 from poppy.application.review_cycle import ReviewRequest
+from poppy.github_setup import GitHubSetupStore, github_app_manifest
 from poppy.setup_session import SetupSessionStore, SetupStateError
 from poppy.webhook import InvalidWebhook, normalize_pull_request_webhook, verify_signature
 
@@ -36,12 +39,38 @@ SETUP_PAGE = """<!doctype html>
       <h2 id="connections-heading">Connections</h2>
       <dl>
         <dt>GitHub</dt>
-        <dd>Not connected</dd>
+        <dd>
+          Not connected
+          <form action="/setup/github/connect" method="post">
+            <input type="hidden" name="csrf_token" value="{csrf_token}">
+            <button type="submit">Connect GitHub</button>
+          </form>
+        </dd>
         <dt>ChatGPT</dt>
         <dd>Not connected</dd>
       </dl>
     </section>
   </main>
+</body>
+</html>
+"""
+
+GITHUB_MANIFEST_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Connect GitHub</title>
+</head>
+<body>
+  <main>
+    <h1>Continue to GitHub</h1>
+    <form action="{action}" method="post">
+      <input type="hidden" name="manifest" value="{manifest}">
+      <button type="submit">Register Poppy on GitHub</button>
+    </form>
+  </main>
+  <script nonce="{script_nonce}">document.forms[0].submit()</script>
 </body>
 </html>
 """
@@ -54,6 +83,7 @@ class SchedulerPort(Protocol):
 def create_setup_app(
     *,
     setup_session: SetupSessionStore,
+    github_setup: GitHubSetupStore,
     public_base_url: HttpUrl,
     lifespan: Lifespan[FastAPI] | None = None,
 ) -> FastAPI:
@@ -136,6 +166,29 @@ def create_setup_app(
     async def unavailable_github_webhook() -> JSONResponse:
         return JSONResponse({"error": "reviewer unavailable"}, status_code=503)
 
+    @app.post("/setup/github/connect")
+    async def connect_github() -> HTMLResponse:
+        correlation_state = github_setup.begin_manifest()
+        action = "https://github.com/settings/apps/new?" + urlencode({"state": correlation_state})
+        manifest = json.dumps(
+            github_app_manifest(expected_origin),
+            separators=(",", ":"),
+        )
+        script_nonce = secrets.token_urlsafe(18)
+        response = HTMLResponse(
+            GITHUB_MANIFEST_PAGE.format(
+                action=html.escape(action, quote=True),
+                manifest=html.escape(manifest, quote=True),
+                script_nonce=html.escape(script_nonce, quote=True),
+            )
+        )
+        response.headers["content-security-policy"] = (
+            "default-src 'none'; base-uri 'none'; "
+            "form-action https://github.com; frame-ancestors 'none'; "
+            f"script-src 'nonce-{script_nonce}'"
+        )
+        return response
+
     return app
 
 
@@ -161,9 +214,10 @@ async def _setup_form_csrf_token(request: Request) -> str | None:
 
 def _protect_setup_response(response: Response) -> Response:
     response.headers["cache-control"] = "no-store"
-    response.headers["content-security-policy"] = (
-        "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
-    )
+    if "content-security-policy" not in response.headers:
+        response.headers["content-security-policy"] = (
+            "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+        )
     response.headers["permissions-policy"] = "camera=(), microphone=(), geolocation=()"
     response.headers["referrer-policy"] = "no-referrer"
     response.headers["strict-transport-security"] = "max-age=31536000"

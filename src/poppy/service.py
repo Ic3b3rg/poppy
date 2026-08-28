@@ -15,6 +15,7 @@ from poppy.application.review_cycle import ReviewCycle
 from poppy.application.scheduler import InMemoryScheduler
 from poppy.codex_runtime import build_codex_config, require_chatgpt_account
 from poppy.config import CONTEXT_OVERHEAD_RESERVE, PoppySettings, read_github_private_key
+from poppy.github_setup import GitHubSetupStore
 from poppy.http import create_app, create_setup_app
 from poppy.setup_session import (
     BOOTSTRAP_TTL_SECONDS,
@@ -45,6 +46,7 @@ def create_service(
                 session_ttl_seconds=SESSION_TTL_SECONDS,
                 clock=clock,
             )
+            github_setup = GitHubSetupStore(data_dir=data_dir)
             bootstrap_token = setup_session.initialize()
         except (OSError, SetupStateError) as error:
             raise RuntimeConfigurationError("Poppy setup state is not usable") from error
@@ -58,6 +60,7 @@ def create_service(
             )
         return create_setup_app(
             setup_session=setup_session,
+            github_setup=github_setup,
             public_base_url=settings.public_base_url,
         )
 
