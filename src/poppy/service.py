@@ -16,7 +16,7 @@ from poppy.adapters.codex_onboarding import (
     CodexOnboardingPort,
 )
 from poppy.adapters.github import GitHubAdapter
-from poppy.adapters.github_onboarding import GitHubOnboarding
+from poppy.adapters.github_onboarding import GitHubAppCredentials, GitHubOnboarding
 from poppy.application.review_cycle import ReviewCycle
 from poppy.application.scheduler import InMemoryScheduler
 from poppy.chatgpt_setup import ChatGPTSetup, ChatGPTSetupStore
@@ -71,24 +71,17 @@ def create_service(
     private_key = read_github_private_key(credentials.private_key_file)
     github_client = httpx.AsyncClient(timeout=httpx.Timeout(30, connect=10))
     codex_client = AsyncCodex(build_codex_config(codex_home))
-    github = GitHubAdapter(
-        app_id=str(credentials.app_id),
+    adapters = _build_reviewer_adapters(
+        settings=settings,
+        app_id=credentials.app_id,
         private_key=private_key,
-        client=github_client,
-        max_patch_characters=(settings.context_limit_characters - CONTEXT_OVERHEAD_RESERVE),
-    )
-    codex = CodexAdapter(
-        client=codex_client,
+        github_client=github_client,
+        codex_client=codex_client,
         workspace=workspace,
-        model=settings.model,
-        timeout_seconds=settings.review_timeout_seconds,
-        max_input_characters=settings.context_limit_characters,
-        language=settings.review_language,
-        tone=settings.review_tone,
     )
     cycle = ReviewCycle(
-        github=github,
-        codex=codex,
+        github=adapters.github,
+        codex=adapters.codex,
         blocking_severity=settings.blocking_severity,
     )
     scheduler = InMemoryScheduler(
@@ -125,33 +118,61 @@ class _ProductionReviewerAdapterFactory:
         self._settings = settings
         self._github_client = github_client
         self._codex_client = codex_client
+        self._github_onboarding = GitHubOnboarding(client=github_client)
 
     async def create(self, connection: ReviewerConnection) -> ReviewerAdapters:
         _, workspace = _prepare_directories(
             codex_home=self._settings.codex_home,
             workspace=self._settings.codex_workspace,
         )
+        app = GitHubAppCredentials(
+            app_id=connection.app_id,
+            slug=connection.app_slug,
+            private_key=connection.private_key,
+            webhook_secret=connection.webhook_secret,
+        )
+        await self._github_onboarding.get_installation(
+            app=app,
+            installation_id=connection.installation_id,
+        )
         plan = await require_chatgpt_account(self._codex_client)
         logger.info("Codex authenticated with ChatGPT", extra={"chatgpt_plan": plan})
-        return ReviewerAdapters(
-            github=GitHubAdapter(
-                app_id=str(connection.app_id),
-                private_key=connection.private_key,
-                client=self._github_client,
-                max_patch_characters=(
-                    self._settings.context_limit_characters - CONTEXT_OVERHEAD_RESERVE
-                ),
-            ),
-            codex=CodexAdapter(
-                client=self._codex_client,
-                workspace=workspace,
-                model=self._settings.model,
-                timeout_seconds=self._settings.review_timeout_seconds,
-                max_input_characters=self._settings.context_limit_characters,
-                language=self._settings.review_language,
-                tone=self._settings.review_tone,
-            ),
+        return _build_reviewer_adapters(
+            settings=self._settings,
+            app_id=connection.app_id,
+            private_key=connection.private_key,
+            github_client=self._github_client,
+            codex_client=self._codex_client,
+            workspace=workspace,
         )
+
+
+def _build_reviewer_adapters(
+    *,
+    settings: PoppySettings,
+    app_id: int,
+    private_key: str,
+    github_client: httpx.AsyncClient,
+    codex_client: AsyncCodex,
+    workspace: Path,
+) -> ReviewerAdapters:
+    return ReviewerAdapters(
+        github=GitHubAdapter(
+            app_id=str(app_id),
+            private_key=private_key,
+            client=github_client,
+            max_patch_characters=(settings.context_limit_characters - CONTEXT_OVERHEAD_RESERVE),
+        ),
+        codex=CodexAdapter(
+            client=codex_client,
+            workspace=workspace,
+            model=settings.model,
+            timeout_seconds=settings.review_timeout_seconds,
+            max_input_characters=settings.context_limit_characters,
+            language=settings.review_language,
+            tone=settings.review_tone,
+        ),
+    )
 
 
 def _create_onboarding_service(
@@ -252,13 +273,17 @@ def _create_onboarding_service(
                     )
             try:
                 await runtime.start()
-            except RuntimeStateError as error:
+            except RuntimeStateError:
                 if runtime.setup_closed:
-                    raise RuntimeConfigurationError("Poppy reviewer state is not usable") from error
-                logger.warning(
-                    "Poppy reviewer promotion could not resume",
-                    extra={"event": "reviewer_promotion_resume_failed"},
-                )
+                    logger.error(
+                        "Poppy reviewer state is unavailable",
+                        extra={"event": "reviewer_state_unavailable"},
+                    )
+                else:
+                    logger.warning(
+                        "Poppy reviewer promotion could not resume",
+                        extra={"event": "reviewer_promotion_resume_failed"},
+                    )
             yield
         finally:
             await chatgpt_setup.close()
@@ -290,6 +315,8 @@ def _load_setup_connection(
         return None
     return ReviewerConnection(
         app_id=connected.app.app_id,
+        app_slug=connected.app.slug,
+        installation_id=connected.installation.installation_id,
         private_key=connected.app.private_key,
         webhook_secret=connected.app.webhook_secret,
     )

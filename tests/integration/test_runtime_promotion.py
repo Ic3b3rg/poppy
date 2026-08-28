@@ -6,7 +6,6 @@ import json
 import logging
 import re
 import stat
-import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -64,22 +63,7 @@ async def test_setup_promotes_in_process_and_restart_reviews_a_signed_pull_reque
         )
         csrf_token = await establish_setup_session(client, setup_url)
 
-        manifest = await client.post(
-            "/setup/github/connect",
-            data={"csrf_token": csrf_token},
-            headers={"origin": "https://poppy.example"},
-        )
-        manifest_callback = await client.get(
-            "/setup/github/manifest/callback",
-            params={"code": "manifest-code", "state": manifest_state_from(manifest)},
-        )
-        installation_state = parse_qs(urlparse(manifest_callback.headers["location"]).query)[
-            "state"
-        ][0]
-        installation_callback = await client.get(
-            "/setup/github/installation",
-            params={"installation_id": "456", "state": installation_state},
-        )
+        installation_callback = await connect_github(client, csrf_token=csrf_token)
 
         github_only = await client.get("/healthz")
         chatgpt_start = await client.post(
@@ -113,6 +97,8 @@ async def test_setup_promotes_in_process_and_restart_reviews_a_signed_pull_reque
     assert first_reviewer.connections == [
         ReviewerConnection(
             app_id=123,
+            app_slug="poppy-example",
+            installation_id=456,
             private_key=private_key,
             webhook_secret=webhook_secret,
         )
@@ -201,31 +187,111 @@ async def test_readiness_is_independent_of_integration_order(
         codex_onboarding.complete()
         chatgpt_only = await wait_for_setup_text(client, "Success. Connected")
 
-        manifest = await client.post(
-            "/setup/github/connect",
-            data={"csrf_token": csrf_token},
-            headers={"origin": "https://poppy.example"},
-        )
-        manifest_callback = await client.get(
-            "/setup/github/manifest/callback",
-            params={"code": "manifest-code", "state": manifest_state_from(manifest)},
-        )
-        installation_state = parse_qs(urlparse(manifest_callback.headers["location"]).query)[
-            "state"
-        ][0]
-        installed = await client.get(
-            "/setup/github/installation",
-            params={"installation_id": "456", "state": installation_state},
-        )
+        installed = await connect_github(client, csrf_token=csrf_token)
         health = await client.get("/healthz")
         closed_setup = await client.get("/setup")
 
     assert chatgpt_only.status_code == 200
     assert "Connect GitHub" in chatgpt_only.text
-    assert installed.status_code == 303
+    assert installed.status_code == 404
     assert health.json() == {"status": "ok", "mode": "reviewer"}
     assert closed_setup.status_code == 404
     assert len(reviewer.connections) == 1
+    await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_promotion_waits_for_an_admitted_setup_request_and_hides_its_response(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    private_key = github_private_key()
+    webhook_secret = "generated-webhook-secret"
+    provider = github_provider(private_key=private_key, webhook_secret=webhook_secret)
+    codex_onboarding = FakeCodexOnboarding()
+    reviewer = FakeReviewerAdapterFactory()
+    configured = setup_settings(tmp_path)
+    setup_request_started = asyncio.Event()
+    release_setup_request = asyncio.Event()
+    caplog.set_level(logging.WARNING, logger="poppy.service")
+    app = create_service(
+        configured,
+        github_onboarding_client=provider,
+        codex_onboarding=codex_onboarding,
+        reviewer_adapter_factory=reviewer,
+    )
+
+    @app.get("/setup/in-flight")
+    async def in_flight_setup_request() -> dict[str, str]:
+        setup_request_started.set()
+        await release_setup_request.wait()
+        return {"status": "setup data"}
+
+    async with app.router.lifespan_context(app), setup_client(app) as client:
+        csrf_token = await establish_setup_session(client, setup_url_from(caplog))
+        await connect_github(client, csrf_token=csrf_token)
+        await client.post(
+            "/setup/chatgpt/connect",
+            data={"csrf_token": csrf_token},
+            headers={"origin": "https://poppy.example"},
+        )
+        admitted_setup = asyncio.create_task(client.get("/setup/in-flight"))
+        await setup_request_started.wait()
+
+        codex_onboarding.complete()
+        await codex_onboarding.completion_returned.wait()
+
+        assert not (configured.data_dir / "readiness.json").exists()
+        blocked_webhook = await post_signed_webhook(client, secret=webhook_secret)
+        assert blocked_webhook.status_code == 503
+
+        release_setup_request.set()
+        hidden_setup = await admitted_setup
+        promoted = await wait_for_mode(client, "reviewer")
+
+    assert hidden_setup.status_code == 404
+    assert promoted.json() == {"status": "ok", "mode": "reviewer"}
+    assert len(reviewer.connections) == 1
+    await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_transient_runtime_failure_retries_from_the_live_setup_page(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    private_key = github_private_key()
+    webhook_secret = "generated-webhook-secret"
+    provider = github_provider(private_key=private_key, webhook_secret=webhook_secret)
+    codex_onboarding = FakeCodexOnboarding()
+    provider_detail = "provider-secret-that-must-not-escape"
+    reviewer = FlakyReviewerAdapterFactory(provider_detail)
+    caplog.set_level(logging.WARNING, logger="poppy.service")
+    app = create_service(
+        setup_settings(tmp_path),
+        github_onboarding_client=provider,
+        codex_onboarding=codex_onboarding,
+        reviewer_adapter_factory=reviewer,
+    )
+
+    async with app.router.lifespan_context(app), setup_client(app) as client:
+        csrf_token = await establish_setup_session(client, setup_url_from(caplog))
+        await connect_github(client, csrf_token=csrf_token)
+        await client.post(
+            "/setup/chatgpt/connect",
+            data={"csrf_token": csrf_token},
+            headers={"origin": "https://poppy.example"},
+        )
+        codex_onboarding.complete()
+        await reviewer.first_failure.wait()
+
+        retry = await client.get("/setup")
+        health = await client.get("/healthz")
+
+    assert retry.status_code == 404
+    assert health.json() == {"status": "ok", "mode": "reviewer"}
+    assert reviewer.attempts == 2
+    assert provider_detail not in caplog.text
     await provider.aclose()
 
 
@@ -250,22 +316,7 @@ async def test_failed_session_removal_closes_setup_without_claiming_reviewer_mod
 
     async with app.router.lifespan_context(app), setup_client(app) as client:
         csrf_token = await establish_setup_session(client, setup_url_from(caplog))
-        manifest = await client.post(
-            "/setup/github/connect",
-            data={"csrf_token": csrf_token},
-            headers={"origin": "https://poppy.example"},
-        )
-        manifest_callback = await client.get(
-            "/setup/github/manifest/callback",
-            params={"code": "manifest-code", "state": manifest_state_from(manifest)},
-        )
-        installation_state = parse_qs(urlparse(manifest_callback.headers["location"]).query)[
-            "state"
-        ][0]
-        await client.get(
-            "/setup/github/installation",
-            params={"installation_id": "456", "state": installation_state},
-        )
+        await connect_github(client, csrf_token=csrf_token)
         await client.post(
             "/setup/chatgpt/connect",
             data={"csrf_token": csrf_token},
@@ -310,28 +361,16 @@ async def test_ready_instance_with_invalid_runtime_fails_closed_without_secret_c
         reviewer_adapter_factory=RejectingReviewerAdapterFactory(provider_detail),
     )
 
-    async with setup_client(app) as client:
+    async with app.router.lifespan_context(app), setup_client(app) as client:
         setup = await client.get("/setup")
         health = await client.get("/healthz")
         webhook = await post_signed_webhook(client, secret=webhook_secret)
 
-    with pytest.raises(RuntimeConfigurationError) as raised:
-        async with app.router.lifespan_context(app):
-            pass
-
-    rendered_exception = "".join(
-        traceback.format_exception(
-            type(raised.value),
-            raised.value,
-            raised.value.__traceback__,
-        )
-    )
     assert setup.status_code == 404
     assert health.json() == {"status": "ok", "mode": "unavailable"}
     assert webhook.status_code == 503
     assert "Poppy Setup Session" not in caplog.text
     assert provider_detail not in caplog.text
-    assert provider_detail not in rendered_exception
     await provider.aclose()
 
 
@@ -394,6 +433,7 @@ async def test_ready_restart_reuses_one_runtime_client_pair_and_closes_each_once
     codex_client.close = AsyncMock()
     github_client = MagicMock(spec=httpx.AsyncClient)
     github_client.aclose = AsyncMock()
+    github_client.get = AsyncMock(return_value=validated_installation_response())
     require_account = AsyncMock(return_value="plus")
     codex_factory = MagicMock(return_value=codex_client)
     github_factory = MagicMock(return_value=github_client)
@@ -410,14 +450,64 @@ async def test_ready_restart_reuses_one_runtime_client_pair_and_closes_each_once
     assert codex_factory.call_count == 1
     assert github_factory.call_count == 1
     require_account.assert_awaited_once_with(codex_client)
+    github_client.get.assert_awaited_once()
     codex_client.close.assert_awaited_once()
     github_client.aclose.assert_awaited_once()
     assert "Poppy Setup Session" not in caplog.text
 
 
+@pytest.mark.asyncio
+async def test_ready_restart_with_revoked_github_installation_stays_unavailable(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured = setup_settings(tmp_path)
+    private_key = github_private_key()
+    webhook_secret = "generated-webhook-secret"
+    seed_ready_state(
+        configured.data_dir,
+        private_key=private_key,
+        webhook_secret=webhook_secret,
+    )
+    provider_detail = "provider-secret-that-must-not-escape"
+    codex_client = MagicMock()
+    codex_client.close = AsyncMock()
+    github_client = MagicMock(spec=httpx.AsyncClient)
+    github_client.aclose = AsyncMock()
+    github_client.get = AsyncMock(
+        return_value=httpx.Response(
+            404,
+            headers={"x-github-request-id": provider_detail},
+        )
+    )
+    monkeypatch.setattr(service_module, "AsyncCodex", MagicMock(return_value=codex_client))
+    monkeypatch.setattr(service_module.httpx, "AsyncClient", MagicMock(return_value=github_client))
+    monkeypatch.setattr(
+        service_module,
+        "require_chatgpt_account",
+        AsyncMock(return_value="plus"),
+    )
+    caplog.set_level(logging.WARNING, logger="poppy.service")
+
+    app = create_service(configured)
+    async with app.router.lifespan_context(app), setup_client(app) as client:
+        health = await client.get("/healthz")
+        setup = await client.get("/setup")
+        webhook = await post_signed_webhook(client, secret=webhook_secret)
+
+    assert health.json() == {"status": "ok", "mode": "unavailable"}
+    assert setup.status_code == 404
+    assert webhook.status_code == 503
+    assert provider_detail not in caplog.text
+    codex_client.close.assert_awaited_once()
+    github_client.aclose.assert_awaited_once()
+
+
 @dataclass
 class FakeCodexOnboarding:
     completion: asyncio.Event = field(default_factory=asyncio.Event)
+    completion_returned: asyncio.Event = field(default_factory=asyncio.Event)
 
     async def start_device_authorization(self) -> CodexDeviceAuthorization:
         return CodexDeviceAuthorization(
@@ -429,6 +519,7 @@ class FakeCodexOnboarding:
     async def wait_for_completion(self, login_id: str) -> None:
         assert login_id == "login-1"
         await self.completion.wait()
+        self.completion_returned.set()
 
     async def cancel(self, login_id: str) -> None:
         raise AssertionError(f"unexpected cancellation for {login_id}")
@@ -457,6 +548,22 @@ class RejectingReviewerAdapterFactory:
 
     async def create(self, connection: ReviewerConnection) -> ReviewerAdapters:
         raise RuntimeError(self._detail)
+
+
+class FlakyReviewerAdapterFactory:
+    def __init__(self, detail: str) -> None:
+        self._detail = detail
+        self.attempts = 0
+        self.first_failure = asyncio.Event()
+        self.github = FakeGitHub()
+        self.codex = FakeCodex()
+
+    async def create(self, connection: ReviewerConnection) -> ReviewerAdapters:
+        self.attempts += 1
+        if self.attempts == 1:
+            self.first_failure.set()
+            raise RuntimeError(self._detail)
+        return ReviewerAdapters(github=self.github, codex=self.codex)
 
 
 class FakeGitHub:
@@ -540,6 +647,38 @@ def github_provider(*, private_key: str, webhook_secret: str) -> httpx.AsyncClie
     return httpx.AsyncClient(
         base_url="https://api.github.test",
         transport=httpx.MockTransport(github),
+    )
+
+
+def validated_installation_response() -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "id": 456,
+            "app_id": 123,
+            "app_slug": "poppy-example",
+            "account": {"id": 789, "login": "operator", "type": "User"},
+            "target_type": "User",
+            "repository_selection": "selected",
+            "suspended_at": None,
+        },
+    )
+
+
+async def connect_github(client: httpx.AsyncClient, *, csrf_token: str) -> httpx.Response:
+    manifest = await client.post(
+        "/setup/github/connect",
+        data={"csrf_token": csrf_token},
+        headers={"origin": "https://poppy.example"},
+    )
+    manifest_callback = await client.get(
+        "/setup/github/manifest/callback",
+        params={"code": "manifest-code", "state": manifest_state_from(manifest)},
+    )
+    installation_state = parse_qs(urlparse(manifest_callback.headers["location"]).query)["state"][0]
+    return await client.get(
+        "/setup/github/installation",
+        params={"installation_id": "456", "state": installation_state},
     )
 
 

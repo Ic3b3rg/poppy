@@ -1,9 +1,10 @@
 import asyncio
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 from poppy.application.review_cycle import CodexPort, GitHubPort, ReviewCycle, ReviewRequest
 from poppy.application.scheduler import InMemoryScheduler
@@ -16,6 +17,7 @@ from poppy.private_state import (
 from poppy.setup_session import SetupSessionStore, SetupStateError
 
 READINESS_STATE_FILE = "readiness.json"
+type RuntimeMode = Literal["setup", "reviewer", "unavailable"]
 
 
 class RuntimeStateError(RuntimeError):
@@ -25,6 +27,8 @@ class RuntimeStateError(RuntimeError):
 @dataclass(frozen=True, slots=True)
 class ReviewerConnection:
     app_id: int
+    app_slug: str
+    installation_id: int
     private_key: str = field(repr=False)
     webhook_secret: str = field(repr=False)
 
@@ -41,6 +45,42 @@ class ReviewerAdapterFactory(Protocol):
 
 class SchedulerPort(Protocol):
     async def schedule(self, request: ReviewRequest) -> bool: ...
+
+
+class _SetupGate:
+    def __init__(self, *, is_closed: Callable[[], bool]) -> None:
+        self._is_closed = is_closed
+        self._condition = asyncio.Condition()
+        self._active_requests = 0
+        self._promotion_pending = False
+
+    @asynccontextmanager
+    async def access(self) -> AsyncIterator[bool]:
+        async with self._condition:
+            await self._condition.wait_for(lambda: not self._promotion_pending or self._is_closed())
+            admitted = not self._is_closed()
+            if admitted:
+                self._active_requests += 1
+        try:
+            yield admitted
+        finally:
+            if admitted:
+                async with self._condition:
+                    self._active_requests -= 1
+                    self._condition.notify_all()
+
+    @asynccontextmanager
+    async def promotion(self) -> AsyncIterator[None]:
+        async with self._condition:
+            self._promotion_pending = True
+        try:
+            async with self._condition:
+                await self._condition.wait_for(lambda: self._active_requests == 0)
+            yield
+        finally:
+            async with self._condition:
+                self._promotion_pending = False
+                self._condition.notify_all()
 
 
 async def _nothing_to_close() -> None:
@@ -116,9 +156,10 @@ class InstanceRuntime:
         self._setup_closed = initially_ready
         self._active: ActiveReviewer | None = None
         self._promotion_lock = asyncio.Lock()
+        self._setup_gate = _SetupGate(is_closed=lambda: self._setup_closed)
 
     @property
-    def mode(self) -> str:
+    def mode(self) -> RuntimeMode:
         if self._active is not None:
             return "reviewer"
         return "unavailable" if self._setup_closed else "setup"
@@ -129,6 +170,11 @@ class InstanceRuntime:
 
     def active_reviewer(self) -> ActiveReviewer | None:
         return self._active
+
+    @asynccontextmanager
+    async def setup_access(self) -> AsyncIterator[bool]:
+        async with self._setup_gate.access() as setup_available:
+            yield setup_available
 
     async def start(self) -> None:
         if self._setup_closed:
@@ -158,9 +204,10 @@ class InstanceRuntime:
 
             active = await self._build_reviewer(connection)
             try:
-                self._readiness.mark_ready()
-                self._setup_closed = True
-                self._setup_session.close()
+                async with self._setup_gate.promotion():
+                    self._readiness.mark_ready()
+                    self._setup_closed = True
+                    self._setup_session.close()
             except (RuntimeStateError, SetupStateError) as error:
                 await active.close()
                 raise RuntimeStateError("Poppy promotion could not be persisted") from error

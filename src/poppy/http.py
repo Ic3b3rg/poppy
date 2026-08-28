@@ -3,7 +3,8 @@ import json
 import logging
 import re
 import secrets
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from typing import Protocol
 from urllib.parse import parse_qs
@@ -17,7 +18,6 @@ from starlette.types import Lifespan
 
 from poppy.adapters.codex_onboarding import CodexOnboardingError
 from poppy.adapters.github_onboarding import GitHubOnboarding, GitHubOnboardingError
-from poppy.application.review_cycle import ReviewRequest
 from poppy.chatgpt_setup import (
     ChatGPTAuthorizationStart,
     ChatGPTPendingView,
@@ -32,7 +32,12 @@ from poppy.github_setup import (
     installation_url,
     manifest_registration_url,
 )
-from poppy.runtime import ActiveReviewer, RuntimeStateError
+from poppy.runtime import (
+    ActiveReviewer,
+    RuntimeMode,
+    RuntimeStateError,
+    SchedulerPort,
+)
 from poppy.setup_session import SetupSessionStore, SetupStateError
 from poppy.webhook import InvalidWebhook, normalize_pull_request_webhook, verify_signature
 
@@ -93,18 +98,18 @@ GITHUB_MANIFEST_PAGE = """<!doctype html>
 """
 
 
-class SchedulerPort(Protocol):
-    async def schedule(self, request: ReviewRequest) -> bool: ...
-
-
 class ReviewerRuntimePort(Protocol):
     @property
-    def mode(self) -> str: ...
+    def mode(self) -> RuntimeMode: ...
 
+    def active_reviewer(self) -> ActiveReviewer | None: ...
+
+
+class SetupRuntimePort(ReviewerRuntimePort, Protocol):
     @property
     def setup_closed(self) -> bool: ...
 
-    def active_reviewer(self) -> ActiveReviewer | None: ...
+    def setup_access(self) -> AbstractAsyncContextManager[bool]: ...
 
     async def promote_if_ready(self) -> bool: ...
 
@@ -116,10 +121,10 @@ def create_setup_app(
     github_onboarding: GitHubOnboarding,
     chatgpt_setup: ChatGPTSetup,
     public_base_url: HttpUrl,
-    reviewer_runtime: ReviewerRuntimePort | None = None,
+    reviewer_runtime: SetupRuntimePort | None = None,
     lifespan: Lifespan[FastAPI] | None = None,
 ) -> FastAPI:
-    runtime: ReviewerRuntimePort = reviewer_runtime or _UnavailableReviewerRuntime()
+    runtime: SetupRuntimePort = reviewer_runtime or _UnavailableSetupRuntime()
     app = _create_base_app(mode=lambda: runtime.mode, lifespan=lifespan)
     _register_github_webhook(app, runtime)
     expected_origin = str(public_base_url).rstrip("/")
@@ -131,27 +136,47 @@ def create_setup_app(
     ) -> Response:
         try:
             is_setup_route = request.url.path == "/setup" or request.url.path.startswith("/setup/")
-            if is_setup_route and runtime.setup_closed:
-                return _protect_setup_response(
-                    JSONResponse({"error": "not found"}, status_code=404)
-                )
-            if is_setup_route and request.method not in {"GET", "HEAD", "OPTIONS"}:
-                session_token = request.cookies.get(SETUP_SESSION_COOKIE)
-                if request.headers.get("origin") != expected_origin or session_token is None:
+            if not is_setup_route:
+                return _protect_setup_response(await call_next(request))
+
+            async with runtime.setup_access() as setup_available:
+                if not setup_available:
                     return _protect_setup_response(
                         JSONResponse({"error": "not found"}, status_code=404)
                     )
+                if request.method not in {"GET", "HEAD", "OPTIONS"}:
+                    session_token = request.cookies.get(SETUP_SESSION_COOKIE)
+                    if request.headers.get("origin") != expected_origin or session_token is None:
+                        return _protect_setup_response(
+                            JSONResponse({"error": "not found"}, status_code=404)
+                        )
 
-                csrf_token = await _setup_form_csrf_token(request)
-                if csrf_token is None or not setup_session.mutation_is_authorized(
-                    session_token=session_token,
-                    csrf_token=csrf_token,
-                ):
-                    return _protect_setup_response(
-                        JSONResponse({"error": "not found"}, status_code=404)
+                    csrf_token = await _setup_form_csrf_token(request)
+                    if csrf_token is None or not setup_session.mutation_is_authorized(
+                        session_token=session_token,
+                        csrf_token=csrf_token,
+                    ):
+                        return _protect_setup_response(
+                            JSONResponse({"error": "not found"}, status_code=404)
+                        )
+
+                response = await call_next(request)
+
+            should_promote = getattr(request.state, "promote_reviewer", False) or (
+                request.url.path == "/setup" and response.status_code == 200
+            )
+            if should_promote:
+                try:
+                    await runtime.promote_if_ready()
+                except RuntimeStateError:
+                    logger.warning(
+                        "Poppy reviewer promotion failed",
+                        extra={"event": "reviewer_promotion_failed"},
                     )
 
-            response = await call_next(request)
+            async with runtime.setup_access() as setup_available:
+                if not setup_available:
+                    response = JSONResponse({"error": "not found"}, status_code=404)
             return _protect_setup_response(response)
         except SetupStateError:
             logger.exception(
@@ -181,19 +206,26 @@ def create_setup_app(
                         samesite="strict",
                     )
                 return _protect_setup_response(unavailable_response)
+            github_view = github_setup.view()
+            chatgpt_view = chatgpt_setup.view()
             page = SETUP_PAGE.format(
                 csrf_token=html.escape(csrf_token, quote=True),
                 chatgpt_refresh=(
                     '<meta http-equiv="refresh" content="2; url=/setup">'
-                    if chatgpt_setup.view().status == "pending"
+                    if chatgpt_view.status == "pending"
+                    or (
+                        runtime.mode == "setup"
+                        and github_view.status == "connected"
+                        and chatgpt_view.status == "connected"
+                    )
                     else ""
                 ),
                 github_connection=_github_connection_html(
-                    github_setup.view(),
+                    github_view,
                     csrf_token=csrf_token,
                 ),
                 chatgpt_connection=_chatgpt_connection_html(
-                    chatgpt_setup.view(),
+                    chatgpt_view,
                     csrf_token=csrf_token,
                 ),
             )
@@ -353,14 +385,7 @@ def create_setup_app(
                 {"error": "GitHub App installation validation became stale"},
                 status_code=409,
             )
-        try:
-            await runtime.promote_if_ready()
-        except RuntimeStateError:
-            logger.warning(
-                "Poppy reviewer promotion failed",
-                extra={"event": "reviewer_promotion_failed"},
-            )
-            return JSONResponse({"error": "reviewer unavailable"}, status_code=503)
+        request.state.promote_reviewer = True
         return RedirectResponse("/setup", status_code=303)
 
     return app
@@ -564,7 +589,7 @@ def _register_github_webhook(app: FastAPI, runtime: ReviewerRuntimePort) -> None
 
 def _create_base_app(
     *,
-    mode: Callable[[], str],
+    mode: Callable[[], RuntimeMode],
     lifespan: Lifespan[FastAPI] | None,
 ) -> FastAPI:
     app = FastAPI(title="Poppy", docs_url=None, redoc_url=None, lifespan=lifespan)
@@ -576,12 +601,20 @@ def _create_base_app(
     return app
 
 
-class _UnavailableReviewerRuntime:
-    mode = "setup"
-    setup_closed = False
+@asynccontextmanager
+async def _open_setup_access() -> AsyncIterator[bool]:
+    yield True
+
+
+class _UnavailableSetupRuntime:
+    mode: RuntimeMode = "setup"
+    setup_closed: bool = False
 
     def active_reviewer(self) -> None:
         return None
+
+    def setup_access(self) -> AbstractAsyncContextManager[bool]:
+        return _open_setup_access()
 
     async def promote_if_ready(self) -> bool:
         return False
@@ -590,14 +623,10 @@ class _UnavailableReviewerRuntime:
 @dataclass(frozen=True, slots=True)
 class _StaticReviewerRuntime:
     active: ActiveReviewer
-    mode: str = "reviewer"
-    setup_closed: bool = True
+    mode: RuntimeMode = "reviewer"
 
     def active_reviewer(self) -> ActiveReviewer:
         return self.active
-
-    async def promote_if_ready(self) -> bool:
-        return True
 
 
 async def _read_bounded_body(request: Request, *, max_bytes: int) -> bytes | None:
