@@ -8,6 +8,8 @@ from pathlib import Path
 
 import httpx
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import FastAPI
 
 from poppy.adapters.codex_onboarding import (
@@ -15,7 +17,9 @@ from poppy.adapters.codex_onboarding import (
     CodexOnboardingError,
     CodexUnsupportedAccountError,
 )
+from poppy.adapters.github_onboarding import GitHubAppCredentials, GitHubInstallation
 from poppy.config import PoppySettings
+from poppy.github_setup import GitHubSetupStore
 from poppy.service import RuntimeConfigurationError, create_service
 
 
@@ -41,6 +45,7 @@ async def test_connect_chatgpt_starts_device_authorization_and_shows_only_activa
     assert started.headers["location"] == "/setup"
     assert codex.start_count == 1
     assert "Pending" in page.text
+    assert '<meta http-equiv="refresh" content="2; url=/setup">' in page.text
     assert 'href="https://auth.openai.com/codex/device"' in page.text
     assert "ABCD-1234" in page.text
     assert "login-1" not in page.text
@@ -70,10 +75,17 @@ async def test_success_is_connected_without_github_and_survives_restart(
         )
         codex.complete()
         connected_page = await wait_for_page_text(client, "Connected")
+        github_after_chatgpt = await client.post(
+            "/setup/github/connect",
+            data={"csrf_token": csrf_token},
+            headers={"origin": "https://poppy.example"},
+        )
         session_cookie = client.cookies.get("poppy_setup_session")
 
     assert "Connect GitHub" in connected_page.text
     assert "Success. Connected" in connected_page.text
+    assert github_after_chatgpt.status_code == 200
+    assert "Register Poppy on GitHub" in github_after_chatgpt.text
     assert credential not in connected_page.text
     assert credential not in caplog.text
     assert configured.codex_home.is_relative_to(configured.data_dir)
@@ -96,6 +108,34 @@ async def test_success_is_connected_without_github_and_survives_restart(
 
     assert "ChatGPT" in restarted_page.text
     assert "Connected" in restarted_page.text
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_can_connect_after_github_is_already_connected(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    configured = setup_settings(tmp_path)
+    seed_connected_github(configured.data_dir)
+    codex = FakeCodexOnboarding()
+    caplog.set_level(logging.WARNING, logger="poppy.service")
+    app = create_service(configured, codex_onboarding=codex)
+
+    async with app.router.lifespan_context(app), setup_client(app) as client:
+        csrf_token = await establish_setup_session(client, caplog)
+        github_first_page = await client.get("/setup")
+        await client.post(
+            "/setup/chatgpt/connect",
+            data={"csrf_token": csrf_token},
+            headers={"origin": "https://poppy.example"},
+        )
+        codex.complete()
+        both_connected_page = await wait_for_page_text(client, "Success. Connected")
+
+    assert re.search(r"<dt>GitHub</dt>\s*<dd>Connected</dd>", github_first_page.text)
+    assert "Connect ChatGPT" in github_first_page.text
+    assert re.search(r"<dt>GitHub</dt>\s*<dd>Connected</dd>", both_connected_page.text)
+    assert "Success. Connected" in both_connected_page.text
 
 
 @pytest.mark.asyncio
@@ -177,6 +217,43 @@ async def test_pending_authorization_can_be_cancelled_and_retried(
     assert retried.status_code == 303
     assert "Pending" in pending_page.text
     assert codex.start_count == 2
+
+
+@pytest.mark.asyncio
+async def test_cancel_failure_is_sanitized_and_leaves_authorization_pending(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    provider_detail = "cancel response containing sensitive provider detail"
+    codex = FakeCodexOnboarding(
+        cancel_failures=[CodexOnboardingError(provider_detail)],
+    )
+    caplog.set_level(logging.WARNING)
+    app = create_service(setup_settings(tmp_path), codex_onboarding=codex)
+
+    async with app.router.lifespan_context(app), setup_client(app) as client:
+        csrf_token = await establish_setup_session(client, caplog)
+        await client.post(
+            "/setup/chatgpt/connect",
+            data={"csrf_token": csrf_token},
+            headers={"origin": "https://poppy.example"},
+        )
+        cancelled = await client.post(
+            "/setup/chatgpt/cancel",
+            data={"csrf_token": csrf_token},
+            headers={"origin": "https://poppy.example"},
+        )
+        page = await client.get("/setup")
+
+    assert cancelled.status_code == 502
+    assert cancelled.json() == {
+        "error": "ChatGPT authorization could not be cancelled; retry from setup"
+    }
+    assert "Pending" in page.text
+    assert "Cancelled" not in page.text
+    assert provider_detail not in cancelled.text
+    assert provider_detail not in page.text
+    assert provider_detail not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -408,6 +485,7 @@ class FakeCodexOnboarding:
     user_code: str = "ABCD-1234"
     cancel_release: asyncio.Event | None = None
     cancel_started: asyncio.Event = field(default_factory=asyncio.Event)
+    cancel_failures: list[CodexOnboardingError] = field(default_factory=list)
 
     async def start_device_authorization(self) -> CodexDeviceAuthorization:
         self.start_count += 1
@@ -432,6 +510,8 @@ class FakeCodexOnboarding:
     async def cancel(self, login_id: str) -> None:
         self.cancelled_login_ids.append(login_id)
         self.cancel_started.set()
+        if self.cancel_failures:
+            raise self.cancel_failures.pop(0)
         if self.cancel_release is not None:
             await self.cancel_release.wait()
 
@@ -450,6 +530,45 @@ def setup_settings(tmp_path: Path) -> PoppySettings:
         codex_workspace=tmp_path / "workspace",
         _env_file=None,
     )
+
+
+def seed_connected_github(data_dir: Path) -> None:
+    data_dir.mkdir(mode=0o700)
+    store = GitHubSetupStore(data_dir=data_dir)
+    registration = store.begin_manifest(
+        organization=None,
+        public_origin="https://poppy.example",
+    )
+    assert registration is not None
+    assert store.consume_manifest(registration.correlation_state)
+    pending = store.await_installation(
+        GitHubAppCredentials(
+            app_id=123,
+            slug="poppy-example",
+            private_key=github_private_key(),
+            webhook_secret="generated-webhook-secret",
+        )
+    )
+    consumed = store.consume_installation(pending.correlation_state)
+    assert consumed is not None
+    assert store.connect(
+        pending=consumed,
+        installation=GitHubInstallation(
+            installation_id=456,
+            account_id=789,
+            account_login="operator",
+            target_type="User",
+        ),
+    )
+
+
+def github_private_key() -> str:
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
 
 
 async def establish_setup_session(
