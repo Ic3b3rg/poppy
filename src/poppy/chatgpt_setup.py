@@ -2,7 +2,7 @@ import asyncio
 import json
 import secrets
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -19,9 +19,8 @@ from poppy.private_state import (
 from poppy.setup_session import SetupStateError
 
 CHATGPT_SETUP_STATE_FILE = "chatgpt-setup.json"
-type ChatGPTSetupStatus = Literal[
+type ChatGPTSettledStatus = Literal[
     "disconnected",
-    "pending",
     "connected",
     "failed",
     "cancelled",
@@ -29,9 +28,17 @@ type ChatGPTSetupStatus = Literal[
 
 
 @dataclass(frozen=True, slots=True)
-class ChatGPTSetupView:
-    status: ChatGPTSetupStatus
-    authorization: CodexDeviceAuthorization | None = None
+class ChatGPTSettledView:
+    status: ChatGPTSettledStatus
+
+
+@dataclass(frozen=True, slots=True)
+class ChatGPTPendingView:
+    authorization: CodexDeviceAuthorization
+    status: Literal["pending"] = field(default="pending", init=False)
+
+
+type ChatGPTSetupView = ChatGPTSettledView | ChatGPTPendingView
 
 
 class ChatGPTSetupStore:
@@ -42,50 +49,51 @@ class ChatGPTSetupStore:
         if not self._state_file.exists():
             return
         state = self._read_state()
-        if state.status == "pending":
-            self._write_state(ChatGPTSetupView(status="failed"))
+        if isinstance(state, ChatGPTPendingView):
+            self._write_state(ChatGPTSettledView(status="failed"))
 
     def view(self) -> ChatGPTSetupView:
         if not self._state_file.exists():
-            return ChatGPTSetupView(status="disconnected")
+            return ChatGPTSettledView(status="disconnected")
         return self._read_state()
 
     def begin(self, authorization: CodexDeviceAuthorization) -> bool:
         state = self.view()
-        if state.status in {"pending", "connected"}:
+        if isinstance(state, ChatGPTPendingView) or state.status == "connected":
             return False
-        self._write_state(ChatGPTSetupView(status="pending", authorization=authorization))
+        self._write_state(ChatGPTPendingView(authorization=authorization))
         return True
 
     def connect(self, login_id: str) -> bool:
         state = self.view()
         if not _matches_pending_login(state, login_id):
             return False
-        self._write_state(ChatGPTSetupView(status="connected"))
+        self._write_state(ChatGPTSettledView(status="connected"))
         return True
 
     def fail(self, login_id: str) -> bool:
         state = self.view()
         if not _matches_pending_login(state, login_id):
             return False
-        self._write_state(ChatGPTSetupView(status="failed"))
+        self._write_state(ChatGPTSettledView(status="failed"))
         return True
 
     def cancel(self, login_id: str) -> bool:
         state = self.view()
         if not _matches_pending_login(state, login_id):
             return False
-        self._write_state(ChatGPTSetupView(status="cancelled"))
+        self._write_state(ChatGPTSettledView(status="cancelled"))
         return True
 
     def fail_to_start(self) -> None:
-        if self.view().status not in {"pending", "connected"}:
-            self._write_state(ChatGPTSetupView(status="failed"))
+        state = self.view()
+        if not isinstance(state, ChatGPTPendingView) and state.status != "connected":
+            self._write_state(ChatGPTSettledView(status="failed"))
 
     def fail_connected(self) -> bool:
         if self.view().status != "connected":
             return False
-        self._write_state(ChatGPTSetupView(status="failed"))
+        self._write_state(ChatGPTSettledView(status="failed"))
         return True
 
     def _read_state(self) -> ChatGPTSetupView:
@@ -129,7 +137,8 @@ class ChatGPTSetup:
 
     async def connect(self) -> bool:
         async with self._connect_lock:
-            if self._store.view().status in {"pending", "connected"}:
+            state = self._store.view()
+            if isinstance(state, ChatGPTPendingView) or state.status == "connected":
                 return True
             try:
                 authorization = await self._codex.start_device_authorization()
@@ -158,10 +167,9 @@ class ChatGPTSetup:
     async def cancel(self) -> bool:
         async with self._connect_lock:
             state = self._store.view()
-            authorization = state.authorization
-            if state.status != "pending" or authorization is None:
+            if not isinstance(state, ChatGPTPendingView):
                 return False
-            login_id = authorization.login_id
+            login_id = state.authorization.login_id
             self._cancelling_login_id = login_id
             try:
                 try:
@@ -200,15 +208,13 @@ class ChatGPTSetup:
 
 
 def _matches_pending_login(state: ChatGPTSetupView, login_id: str) -> bool:
-    return (
-        state.status == "pending"
-        and state.authorization is not None
-        and secrets.compare_digest(state.authorization.login_id, login_id)
+    return isinstance(state, ChatGPTPendingView) and secrets.compare_digest(
+        state.authorization.login_id, login_id
     )
 
 
 def _serialize_state(state: ChatGPTSetupView) -> dict[str, object]:
-    if state.status == "pending" and state.authorization is not None:
+    if isinstance(state, ChatGPTPendingView):
         return {
             "version": 1,
             "status": "pending",
@@ -216,9 +222,7 @@ def _serialize_state(state: ChatGPTSetupView) -> dict[str, object]:
             "verification_url": state.authorization.verification_url,
             "user_code": state.authorization.user_code,
         }
-    if state.status in {"connected", "failed", "cancelled"} and state.authorization is None:
-        return {"version": 1, "status": state.status}
-    raise SetupStateError("ChatGPT setup state has an impossible phase")
+    return {"version": 1, "status": state.status}
 
 
 def _parse_state(payload: Any) -> ChatGPTSetupView:
@@ -246,10 +250,10 @@ def _parse_state(payload: Any) -> ChatGPTSetupView:
             )
         except (TypeError, ValueError) as error:
             raise SetupStateError("ChatGPT setup state has invalid activation data") from error
-        return ChatGPTSetupView(status="pending", authorization=authorization)
+        return ChatGPTPendingView(authorization=authorization)
     if status in {"connected", "failed", "cancelled"} and set(payload) == {
         "version",
         "status",
     }:
-        return ChatGPTSetupView(status=status)
+        return ChatGPTSettledView(status=status)
     raise SetupStateError("ChatGPT setup state has an unsupported phase")

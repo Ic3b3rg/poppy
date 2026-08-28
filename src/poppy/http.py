@@ -16,7 +16,11 @@ from starlette.types import Lifespan
 from poppy.adapters.codex_onboarding import CodexOnboardingError
 from poppy.adapters.github_onboarding import GitHubOnboarding, GitHubOnboardingError
 from poppy.application.review_cycle import ReviewRequest
-from poppy.chatgpt_setup import ChatGPTSetup, ChatGPTSetupView
+from poppy.chatgpt_setup import (
+    ChatGPTPendingView,
+    ChatGPTSetup,
+    ChatGPTSetupView,
+)
 from poppy.github_setup import (
     GitHubOrganization,
     GitHubSetupStore,
@@ -381,7 +385,7 @@ def _github_connection_html(view: GitHubSetupView, *, csrf_token: str) -> str:
 def _chatgpt_connection_html(view: ChatGPTSetupView, *, csrf_token: str) -> str:
     if view.status == "connected":
         return "Success. Connected"
-    if view.status == "pending" and view.authorization is not None:
+    if isinstance(view, ChatGPTPendingView):
         return (
             "Pending. Open "
             f'<a href="{html.escape(view.authorization.verification_url, quote=True)}">'
