@@ -187,7 +187,10 @@ def create_setup_app(
             return JSONResponse({"error": "GitHub is already connected"}, status_code=409)
         if view.pending is not None:
             return RedirectResponse(installation_url(view.pending), status_code=303)
-        registration = github_setup.begin_manifest(organization=organization)
+        registration = github_setup.begin_manifest(
+            organization=organization,
+            public_origin=expected_origin,
+        )
         if registration is None:
             return JSONResponse(
                 {"error": "GitHub App registration is already in progress"},
@@ -195,10 +198,13 @@ def create_setup_app(
             )
         action = manifest_registration_url(
             correlation_state=registration.correlation_state,
-            organization=registration.organization,
+            organization=registration.context.organization,
         )
         manifest = json.dumps(
-            github_app_manifest(expected_origin),
+            github_app_manifest(
+                expected_origin,
+                app_name=registration.app_name,
+            ),
             separators=(",", ":"),
         )
         script_nonce = secrets.token_urlsafe(18)
@@ -229,13 +235,20 @@ def create_setup_app(
         try:
             app_credentials = await github_onboarding.exchange_manifest(code)
         except GitHubOnboardingError:
-            github_setup.retry_manifest_registration()
+            possible_orphan = github_setup.retry_manifest_registration()
             logger.warning(
                 "GitHub App registration failed",
                 extra={"event": "github_manifest_exchange_failed"},
             )
             return JSONResponse(
-                {"error": "GitHub App registration failed; return to setup and retry"},
+                {
+                    "error": (
+                        "GitHub App registration outcome is uncertain. GitHub may have "
+                        f'created an unused App with proposed name "{possible_orphan.name}"; '
+                        "check GitHub Developer settings and delete it before or after "
+                        "retrying from setup"
+                    )
+                },
                 status_code=502,
             )
         pending = github_setup.await_installation(app_credentials)
@@ -292,25 +305,59 @@ def _positive_decimal_query_parameter(request: Request, name: str) -> int | None
 
 
 def _github_connection_html(view: GitHubSetupView, *, csrf_token: str) -> str:
+    warning = _possible_orphan_warning(view)
     if view.status == "connected":
-        return "Connected"
+        return f"{warning}Connected"
     if view.pending is not None:
         return (
-            "Awaiting installation. "
+            f"{warning}Awaiting installation. "
             f'<a href="{html.escape(installation_url(view.pending), quote=True)}">'
             "Continue on GitHub</a>"
         )
+    organization = (
+        view.context.organization.login
+        if view.context is not None and view.context.organization is not None
+        else ""
+    )
     return (
-        "Not connected"
+        f"{warning}Not connected"
         '<form action="/setup/github/connect" method="post">'
         f'<input type="hidden" name="csrf_token" value="{html.escape(csrf_token, quote=True)}">'
         "<label>GitHub organization (optional) "
-        '<input name="organization" maxlength="39" '
+        f'<input name="organization" value="{html.escape(organization, quote=True)}" '
+        'maxlength="39" '
         'pattern="[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?" '
         'autocomplete="off" autocapitalize="none" spellcheck="false"></label>'
         '<button type="submit">Connect GitHub</button>'
         "</form>"
     )
+
+
+def _possible_orphan_warning(view: GitHubSetupView) -> str:
+    if view.context is None or not view.context.possible_orphan_apps:
+        return ""
+    apps = "".join(
+        (
+            "<li>Proposed name "
+            f"<code>{html.escape(orphan.name)}</code> "
+            f"({_github_app_owner_html(orphan.organization)})</li>"
+        )
+        for orphan in view.context.possible_orphan_apps
+    )
+    return (
+        '<div role="alert">'
+        "<p>A GitHub registration did not finish cleanly. GitHub may have created "
+        "an unused App. Check GitHub Developer settings and delete any unused App "
+        "listed below before or after retrying.</p>"
+        f"<ul>{apps}</ul>"
+        "</div>"
+    )
+
+
+def _github_app_owner_html(organization: GitHubOrganization | None) -> str:
+    if organization is None:
+        return "personal account"
+    return f"organization <code>{html.escape(organization.login)}</code>"
 
 
 async def _setup_form_csrf_token(request: Request) -> str | None:

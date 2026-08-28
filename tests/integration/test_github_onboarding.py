@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import html
 import json
 import logging
@@ -47,9 +48,13 @@ async def test_connect_github_starts_the_exact_private_app_manifest(
     assert manifest_url.scheme == "https"
     assert manifest_url.netloc == "github.com"
     assert manifest_url.path == "/settings/apps/new"
-    assert len(parse_qs(manifest_url.query)["state"][0]) >= 43
+    manifest_state = parse_qs(manifest_url.query)["state"][0]
+    assert len(manifest_state) >= 43
     assert manifest == {
-        "name": "Poppy e6ac4672765c",
+        "name": (
+            "Poppy "
+            + hashlib.sha256(f"https://poppy.example\0{manifest_state}".encode()).hexdigest()[:12]
+        ),
         "url": "https://poppy.example",
         "hook_attributes": {
             "url": "https://poppy.example/webhooks/github",
@@ -112,7 +117,7 @@ async def test_repeated_connect_does_not_replace_the_active_manifest_state(
         )
         repeated = await client.post(
             "/setup/github/connect",
-            data={"csrf_token": csrf_token},
+            data={"csrf_token": csrf_token, "organization": "operator-org"},
             headers={"origin": "https://poppy.example"},
         )
 
@@ -124,6 +129,44 @@ async def test_repeated_connect_does_not_replace_the_active_manifest_state(
     assert urlparse(html.unescape(repeated_action.group(1))).path == (
         "/organizations/operator-org/settings/apps/new"
     )
+
+
+@pytest.mark.asyncio
+async def test_connect_github_can_correct_an_unfinished_organization_target(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="poppy.service")
+    app = create_service(setup_settings(tmp_path))
+
+    async with setup_client(app) as client:
+        csrf_token = await establish_setup_session(client, caplog)
+        first = await client.post(
+            "/setup/github/connect",
+            data={"csrf_token": csrf_token, "organization": "wrong-org"},
+            headers={"origin": "https://poppy.example"},
+        )
+        setup_page = await client.get("/setup")
+        corrected = await client.post(
+            "/setup/github/connect",
+            data={"csrf_token": csrf_token, "organization": "operator-org"},
+            headers={"origin": "https://poppy.example"},
+        )
+        warning = await client.get("/setup")
+
+    first_app_name = manifest_from(first)["name"]
+    assert isinstance(first_app_name, str)
+    assert 'name="organization" value="wrong-org"' in setup_page.text
+    assert corrected.status_code == 200
+    assert manifest_state_from(corrected) != manifest_state_from(first)
+    corrected_action = re.search(r'<form action="([^"]+)" method="post">', corrected.text)
+    assert corrected_action is not None
+    assert urlparse(html.unescape(corrected_action.group(1))).path == (
+        "/organizations/operator-org/settings/apps/new"
+    )
+
+    assert first_app_name in warning.text
+    assert "delete" in warning.text.lower()
 
 
 @pytest.mark.asyncio
@@ -237,6 +280,8 @@ async def test_interrupted_manifest_exchange_is_retryable_after_restart(
             headers={"origin": "https://poppy.example"},
         )
         first_state = manifest_state_from(start)
+        first_app_name = manifest_from(start)["name"]
+        assert isinstance(first_app_name, str)
         callback_task = asyncio.create_task(
             client.get(
                 "/setup/github/manifest/callback",
@@ -256,6 +301,7 @@ async def test_interrupted_manifest_exchange_is_retryable_after_restart(
             domain="poppy.example",
             path="/setup",
         )
+        warning = await restarted_client.get("/setup")
         retry = await restarted_client.post(
             "/setup/github/connect",
             data={"csrf_token": csrf_token},
@@ -264,6 +310,9 @@ async def test_interrupted_manifest_exchange_is_retryable_after_restart(
 
     assert retry.status_code == 200
     assert manifest_state_from(retry) != first_state
+    assert manifest_from(retry)["name"] != first_app_name
+    assert first_app_name in warning.text
+    assert "delete" in warning.text.lower()
 
 
 @pytest.mark.asyncio
@@ -432,20 +481,30 @@ async def test_malformed_manifest_exchange_is_sanitized_and_retryable(
             headers={"origin": "https://poppy.example"},
         )
         first_state = manifest_state_from(first_start)
+        first_app_name = manifest_from(first_start)["name"]
+        assert isinstance(first_app_name, str)
         callback = await client.get(
             "/setup/github/manifest/callback",
             params={"code": "one-time-code", "state": first_state},
         )
+        warning_before_retry = await client.get("/setup")
         retry = await client.post(
             "/setup/github/connect",
             data={"csrf_token": csrf_token},
             headers={"origin": "https://poppy.example"},
         )
+        warning_after_retry = await client.get("/setup")
 
     assert callback.status_code == 502
-    assert callback.json() == {"error": "GitHub App registration failed; return to setup and retry"}
+    assert first_app_name in callback.json()["error"]
+    assert "delete" in callback.json()["error"].lower()
     assert retry.status_code == 200
     assert manifest_state_from(retry) != first_state
+    assert manifest_from(retry)["name"] != manifest_from(first_start)["name"]
+    assert first_app_name in warning_before_retry.text
+    assert first_app_name in warning_after_retry.text
+    assert "delete" in warning_before_retry.text.lower()
+    assert "delete" in warning_after_retry.text.lower()
     persisted = json.loads((tmp_path / "data" / "github-setup.json").read_text(encoding="utf-8"))
     assert persisted["phase"] == "manifest"
     assert "app" not in persisted
@@ -845,6 +904,17 @@ def manifest_state_from(response: httpx.Response) -> str:
     action = re.search(r'<form action="([^"]+)" method="post">', response.text)
     assert action is not None
     return parse_qs(urlparse(html.unescape(action.group(1))).query)["state"][0]
+
+
+def manifest_from(response: httpx.Response) -> dict[str, object]:
+    manifest_input = re.search(
+        r'<input type="hidden" name="manifest" value="([^"]+)">',
+        response.text,
+    )
+    assert manifest_input is not None
+    manifest = json.loads(html.unescape(manifest_input.group(1)))
+    assert isinstance(manifest, dict)
+    return manifest
 
 
 def github_private_key() -> str:
