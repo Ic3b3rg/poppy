@@ -12,8 +12,9 @@ from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import Response
 from starlette.types import Lifespan
 
+from poppy.adapters.github_onboarding import GitHubOnboarding, GitHubOnboardingError
 from poppy.application.review_cycle import ReviewRequest
-from poppy.github_setup import GitHubSetupStore, github_app_manifest
+from poppy.github_setup import GitHubSetupStore, github_app_manifest, installation_url
 from poppy.setup_session import SetupSessionStore, SetupStateError
 from poppy.webhook import InvalidWebhook, normalize_pull_request_webhook, verify_signature
 
@@ -84,6 +85,7 @@ def create_setup_app(
     *,
     setup_session: SetupSessionStore,
     github_setup: GitHubSetupStore,
+    github_onboarding: GitHubOnboarding,
     public_base_url: HttpUrl,
     lifespan: Lifespan[FastAPI] | None = None,
 ) -> FastAPI:
@@ -189,7 +191,36 @@ def create_setup_app(
         )
         return response
 
+    @app.get("/setup/github/manifest/callback")
+    async def github_manifest_callback(request: Request) -> Response:
+        code = _single_query_parameter(request, "code")
+        correlation_state = _single_query_parameter(request, "state")
+        if (
+            code is None
+            or correlation_state is None
+            or not github_setup.consume_manifest(correlation_state)
+        ):
+            return JSONResponse({"error": "not found"}, status_code=404)
+        try:
+            app_credentials = await github_onboarding.exchange_manifest(code)
+        except GitHubOnboardingError:
+            logger.warning(
+                "GitHub App registration failed",
+                extra={"event": "github_manifest_exchange_failed"},
+            )
+            return JSONResponse(
+                {"error": "GitHub App registration failed; return to setup and retry"},
+                status_code=502,
+            )
+        pending = github_setup.await_installation(app_credentials)
+        return RedirectResponse(installation_url(pending), status_code=303)
+
     return app
+
+
+def _single_query_parameter(request: Request, name: str) -> str | None:
+    values = request.query_params.getlist(name)
+    return values[0] if len(values) == 1 and values[0] else None
 
 
 async def _setup_form_csrf_token(request: Request) -> str | None:

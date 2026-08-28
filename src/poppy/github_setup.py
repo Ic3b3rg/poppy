@@ -2,11 +2,20 @@ import json
 import os
 import secrets
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
+from poppy.adapters.github_onboarding import GitHubAppCredentials
 from poppy.setup_session import SetupStateError
 
 GITHUB_SETUP_STATE_FILE = "github-setup.json"
+
+
+@dataclass(frozen=True, slots=True)
+class PendingInstallation:
+    app: GitHubAppCredentials
+    correlation_state: str
 
 
 class GitHubSetupStore:
@@ -23,6 +32,47 @@ class GitHubSetupStore:
             }
         )
         return state
+
+    def consume_manifest(self, presented_state: str) -> bool:
+        payload = self._read_state()
+        if (
+            payload.get("phase") != "manifest"
+            or not isinstance(payload.get("manifest_state"), str)
+            or not secrets.compare_digest(payload["manifest_state"], presented_state)
+        ):
+            return False
+        self._write_state({"version": 1, "phase": "exchange"})
+        return True
+
+    def await_installation(self, app: GitHubAppCredentials) -> PendingInstallation:
+        payload = self._read_state()
+        if payload != {"version": 1, "phase": "exchange"}:
+            raise SetupStateError("GitHub setup state cannot accept App credentials")
+        correlation_state = secrets.token_urlsafe(32)
+        pending = PendingInstallation(app=app, correlation_state=correlation_state)
+        self._write_state(
+            {
+                "version": 1,
+                "phase": "installation",
+                "app": _serialize_app(app),
+                "installation_state": correlation_state,
+            }
+        )
+        return pending
+
+    def _read_state(self) -> dict[str, Any]:
+        try:
+            if self._state_file.is_symlink() or not self._state_file.is_file():
+                raise SetupStateError("GitHub setup state is not a regular file")
+            self._state_file.chmod(0o600)
+            payload: Any = json.loads(self._state_file.read_text(encoding="utf-8"))
+        except SetupStateError:
+            raise
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise SetupStateError("GitHub setup state is not readable") from error
+        if not isinstance(payload, dict):
+            raise SetupStateError("GitHub setup state has an unsupported format")
+        return payload
 
     def _write_state(self, payload: dict[str, object]) -> None:
         directory = self._state_file.parent
@@ -70,4 +120,20 @@ def github_app_manifest(public_origin: str) -> dict[str, object]:
             "metadata": "read",
         },
         "default_events": ["pull_request"],
+    }
+
+
+def installation_url(pending: PendingInstallation) -> str:
+    return (
+        f"https://github.com/apps/{pending.app.slug}/installations/new?"
+        f"state={pending.correlation_state}"
+    )
+
+
+def _serialize_app(app: GitHubAppCredentials) -> dict[str, object]:
+    return {
+        "id": app.app_id,
+        "slug": app.slug,
+        "private_key": app.private_key,
+        "webhook_secret": app.webhook_secret,
     }

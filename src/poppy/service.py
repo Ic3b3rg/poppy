@@ -11,6 +11,7 @@ from openai_codex import AsyncCodex
 
 from poppy.adapters.codex import CodexAdapter
 from poppy.adapters.github import GitHubAdapter
+from poppy.adapters.github_onboarding import GitHubOnboarding
 from poppy.application.review_cycle import ReviewCycle
 from poppy.application.scheduler import InMemoryScheduler
 from poppy.codex_runtime import build_codex_config, require_chatgpt_account
@@ -35,6 +36,7 @@ def create_service(
     settings: PoppySettings,
     *,
     clock: Callable[[], float] = time.time,
+    github_onboarding_client: httpx.AsyncClient | None = None,
 ) -> FastAPI:
     credentials = settings.reviewer_credentials()
     if credentials is None:
@@ -58,10 +60,26 @@ def create_service(
                 setup_url,
                 extra={"event": "setup_bootstrap_created", "setup_url": setup_url},
             )
+        setup_github_client = github_onboarding_client or httpx.AsyncClient(
+            base_url="https://api.github.com",
+            timeout=httpx.Timeout(30, connect=10),
+        )
+        github_onboarding = GitHubOnboarding(client=setup_github_client)
+
+        @asynccontextmanager
+        async def setup_lifespan(_app: FastAPI) -> AsyncIterator[None]:
+            try:
+                yield
+            finally:
+                if github_onboarding_client is None:
+                    await setup_github_client.aclose()
+
         return create_setup_app(
             setup_session=setup_session,
             github_setup=github_setup,
+            github_onboarding=github_onboarding,
             public_base_url=settings.public_base_url,
+            lifespan=setup_lifespan,
         )
 
     codex_home, workspace = _prepare_directories(
