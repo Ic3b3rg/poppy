@@ -166,6 +166,7 @@ The lifecycle and signature handling follow the current official guidance:
 
 - [FastAPI lifespan events](https://fastapi.tiangolo.com/advanced/events/)
 - [Starlette lifespan](https://www.starlette.io/lifespan/)
+- [Starlette pure ASGI middleware](https://www.starlette.io/middleware/#pure-asgi-middleware)
 - [Validating GitHub webhook deliveries](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries)
 
 ## Start, stop, and update

@@ -6,7 +6,8 @@ may arrive first. One in-process runtime module serializes the transition and ow
 Review Cycle and scheduler, while GitHub and Codex remain injected adapters at their external
 seams.
 
-Promotion constructs and validates the reviewer resources before atomically persisting a
+Promotion constructs and validates the reviewer resources, then an outer ASGI gate stops admitting
+new setup requests and lets every admitted response finish before atomically persisting a
 non-secret readiness marker. The marker immediately and permanently makes every Setup Session
 route unavailable. Poppy then durably removes the server-side bootstrap and session state before
 publishing the active reviewer to the webhook handler. Webhooks therefore see either a `503`
