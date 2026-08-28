@@ -406,6 +406,48 @@ async def test_ready_instance_with_invalid_runtime_fails_closed_without_secret_c
     await provider.aclose()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state_file", ["github-setup.json", "chatgpt-setup.json"])
+async def test_ready_marker_with_corrupt_integration_state_serves_unavailable(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    state_file: str,
+) -> None:
+    configured = setup_settings(tmp_path)
+    private_key = github_private_key()
+    webhook_secret = "generated-webhook-secret"
+    seed_ready_state(
+        configured.data_dir,
+        private_key=private_key,
+        webhook_secret=webhook_secret,
+    )
+    provider_detail = "persisted-secret-that-must-not-escape"
+    (configured.data_dir / state_file).write_text(
+        json.dumps({"unexpected": provider_detail}),
+        encoding="utf-8",
+    )
+    provider = github_provider(private_key=private_key, webhook_secret=webhook_secret)
+    caplog.set_level(logging.WARNING, logger="poppy.service")
+
+    async with provider:
+        app = create_service(
+            configured,
+            github_onboarding_client=provider,
+            codex_onboarding=FakeCodexOnboarding(),
+            reviewer_adapter_factory=FakeReviewerAdapterFactory(),
+        )
+        async with app.router.lifespan_context(app), setup_client(app) as client:
+            health = await client.get("/healthz")
+            setup = await client.get("/setup")
+            webhook = await post_signed_webhook(client, secret=webhook_secret)
+
+    assert health.json() == {"status": "ok", "mode": "unavailable"}
+    assert setup.status_code == 404
+    assert webhook.status_code == 503
+    assert "Poppy Setup Session" not in caplog.text
+    assert provider_detail not in caplog.text
+
+
 def test_symlinked_readiness_state_fails_closed_without_touching_target(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,

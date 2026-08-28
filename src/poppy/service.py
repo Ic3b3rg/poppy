@@ -194,11 +194,15 @@ def _create_onboarding_service(
             clock=clock,
         )
         github_setup = GitHubSetupStore(data_dir=data_dir)
-        github_setup.initialize()
         chatgpt_store = ChatGPTSetupStore(data_dir=data_dir)
-        chatgpt_store.initialize()
-        codex_home = _prepare_private_directory(settings.codex_home.expanduser().resolve())
-        bootstrap_token = None if initially_ready else setup_session.initialize()
+        if initially_ready:
+            codex_home = settings.codex_home.expanduser()
+            bootstrap_token = None
+        else:
+            github_setup.initialize()
+            chatgpt_store.initialize()
+            codex_home = _prepare_private_directory(settings.codex_home.expanduser().resolve())
+            bootstrap_token = setup_session.initialize()
     except (OSError, RuntimeStateError, SetupStateError) as error:
         raise RuntimeConfigurationError("Poppy setup state is not usable") from error
 
