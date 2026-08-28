@@ -107,7 +107,7 @@ async def test_repeated_connect_does_not_replace_the_active_manifest_state(
         csrf_token = await establish_setup_session(client, caplog)
         first = await client.post(
             "/setup/github/connect",
-            data={"csrf_token": csrf_token},
+            data={"csrf_token": csrf_token, "organization": "operator-org"},
             headers={"origin": "https://poppy.example"},
         )
         repeated = await client.post(
@@ -119,6 +119,34 @@ async def test_repeated_connect_does_not_replace_the_active_manifest_state(
     assert first.status_code == 200
     assert repeated.status_code == 200
     assert manifest_state_from(repeated) == manifest_state_from(first)
+    repeated_action = re.search(r'<form action="([^"]+)" method="post">', repeated.text)
+    assert repeated_action is not None
+    assert urlparse(html.unescape(repeated_action.group(1))).path == (
+        "/organizations/operator-org/settings/apps/new"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("organization", ["../operator", "-operator", "operator-", "x" * 40])
+async def test_connect_github_rejects_an_invalid_organization(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    organization: str,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="poppy.service")
+    app = create_service(setup_settings(tmp_path))
+
+    async with setup_client(app) as client:
+        csrf_token = await establish_setup_session(client, caplog)
+        response = await client.post(
+            "/setup/github/connect",
+            data={"csrf_token": csrf_token, "organization": organization},
+            headers={"origin": "https://poppy.example"},
+        )
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "invalid GitHub organization"}
+    assert not (tmp_path / "data" / "github-setup.json").exists()
 
 
 @pytest.mark.asyncio
@@ -178,6 +206,64 @@ async def test_connect_cannot_replace_a_manifest_exchange_in_progress(
     assert repeated.status_code == 409
     assert repeated.json() == {"error": "GitHub App registration is already in progress"}
     assert callback.status_code == 303
+
+
+@pytest.mark.asyncio
+async def test_interrupted_manifest_exchange_is_retryable_after_restart(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    exchange_started = asyncio.Event()
+
+    async def interrupted_github(_request: httpx.Request) -> httpx.Response:
+        exchange_started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    configured = setup_settings(tmp_path)
+    provider_client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(interrupted_github),
+    )
+    caplog.set_level(logging.WARNING, logger="poppy.service")
+    app = create_service(configured, github_onboarding_client=provider_client)
+
+    async with provider_client, setup_client(app) as client:
+        csrf_token = await establish_setup_session(client, caplog)
+        session_cookie = client.cookies.get("poppy_setup_session")
+        start = await client.post(
+            "/setup/github/connect",
+            data={"csrf_token": csrf_token},
+            headers={"origin": "https://poppy.example"},
+        )
+        first_state = manifest_state_from(start)
+        callback_task = asyncio.create_task(
+            client.get(
+                "/setup/github/manifest/callback",
+                params={"code": "manifest-code", "state": first_state},
+            )
+        )
+        await exchange_started.wait()
+        callback_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await callback_task
+
+    restarted_app = create_service(configured)
+    async with setup_client(restarted_app) as restarted_client:
+        restarted_client.cookies.set(
+            "poppy_setup_session",
+            session_cookie,
+            domain="poppy.example",
+            path="/setup",
+        )
+        retry = await restarted_client.post(
+            "/setup/github/connect",
+            data={"csrf_token": csrf_token},
+            headers={"origin": "https://poppy.example"},
+        )
+
+    assert retry.status_code == 200
+    assert manifest_state_from(retry) != first_state
 
 
 @pytest.mark.asyncio
@@ -443,6 +529,8 @@ async def test_installation_callback_verifies_the_new_app_and_survives_restart(
             data={"csrf_token": csrf_token, "organization": "operator-org"},
             headers={"origin": "https://poppy.example"},
         )
+        session_cookie = client.cookies.get("poppy_setup_session")
+        client.cookies.clear()
         manifest_callback = await client.get(
             "/setup/github/manifest/callback",
             params={"code": "manifest-code", "state": manifest_state_from(start)},
@@ -458,8 +546,13 @@ async def test_installation_callback_verifies_the_new_app_and_survives_restart(
             "/setup/github/installation",
             params={"installation_id": "456", "state": installation_state},
         )
+        client.cookies.set(
+            "poppy_setup_session",
+            session_cookie,
+            domain="poppy.example",
+            path="/setup",
+        )
         connected_page = await client.get("/setup")
-        session_cookie = client.cookies.get("poppy_setup_session")
 
     assert installation_callback.status_code == 303
     assert installation_callback.headers["location"] == "/setup"

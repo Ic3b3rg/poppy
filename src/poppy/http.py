@@ -16,6 +16,7 @@ from starlette.types import Lifespan
 from poppy.adapters.github_onboarding import GitHubOnboarding, GitHubOnboardingError
 from poppy.application.review_cycle import ReviewRequest
 from poppy.github_setup import (
+    GitHubOrganization,
     GitHubSetupStore,
     GitHubSetupView,
     github_app_manifest,
@@ -28,7 +29,6 @@ from poppy.webhook import InvalidWebhook, normalize_pull_request_webhook, verify
 MAX_WEBHOOK_BYTES = 1_000_000
 MAX_SETUP_FORM_BYTES = 16_384
 SETUP_SESSION_COOKIE = "poppy_setup_session"
-_GITHUB_ACCOUNT_PATTERN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?")
 
 logger = logging.getLogger(__name__)
 
@@ -334,7 +334,7 @@ async def _setup_form_csrf_token(request: Request) -> str | None:
     return csrf_tokens[0] if len(csrf_tokens) == 1 else None
 
 
-def _github_organization(request: Request) -> str | None:
+def _github_organization(request: Request) -> GitHubOrganization | None:
     values: dict[str, list[str]] | None = getattr(request.state, "setup_form_values", None)
     if values is None or "organization" not in values:
         return None
@@ -344,9 +344,7 @@ def _github_organization(request: Request) -> str | None:
     organization = organizations[0]
     if organization == "":
         return None
-    if _GITHUB_ACCOUNT_PATTERN.fullmatch(organization) is None:
-        raise ValueError("invalid GitHub organization")
-    return organization
+    return GitHubOrganization(organization)
 
 
 def _protect_setup_response(response: Response) -> Response:
