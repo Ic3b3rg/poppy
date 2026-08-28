@@ -155,10 +155,12 @@ an instance sealed as ready but unable to construct that runtime reports `mode: 
 continues rejecting webhooks.
 
 On restart, the readiness marker is consulted before any Setup Session is created. A ready
-instance emits no setup link, reloads the connected GitHub credentials and Codex home, validates
-the ChatGPT account, and starts directly in reviewer mode. Missing, corrupt, or invalid ready-state
-credentials never reopen setup. GitHub webhook bodies are authenticated with the persisted secret
-and `X-Hub-Signature-256` before the unchanged Review Cycle is scheduled.
+instance emits no setup link, reloads the connected GitHub credentials and Codex home, revalidates
+the GitHub installation and ChatGPT account, and starts directly in reviewer mode. Missing,
+corrupt, revoked, or invalid ready-state credentials never reopen setup. GitHub webhook bodies are
+authenticated with the persisted secret and `X-Hub-Signature-256` before the unchanged Review
+Cycle is scheduled. Before readiness is sealed, a transient runtime-validation failure is retried
+by the live setup page without requiring a restart.
 
 The lifecycle and signature handling follow the current official guidance:
 
