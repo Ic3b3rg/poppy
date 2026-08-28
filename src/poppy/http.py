@@ -17,6 +17,7 @@ from poppy.adapters.codex_onboarding import CodexOnboardingError
 from poppy.adapters.github_onboarding import GitHubOnboarding, GitHubOnboardingError
 from poppy.application.review_cycle import ReviewRequest
 from poppy.chatgpt_setup import (
+    ChatGPTAuthorizationStart,
     ChatGPTPendingView,
     ChatGPTSetup,
     ChatGPTSetupView,
@@ -244,7 +245,8 @@ def create_setup_app(
 
     @app.post("/setup/chatgpt/connect")
     async def connect_chatgpt() -> Response:
-        if not await chatgpt_setup.connect():
+        started = await chatgpt_setup.start_authorization()
+        if started is ChatGPTAuthorizationStart.FAILED:
             logger.warning(
                 "ChatGPT authorization could not be started",
                 extra={"event": "chatgpt_authorization_start_failed"},

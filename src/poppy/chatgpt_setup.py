@@ -3,6 +3,7 @@ import json
 import secrets
 from contextlib import suppress
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Literal
 
@@ -39,6 +40,12 @@ class ChatGPTPendingView:
 
 
 type ChatGPTSetupView = ChatGPTSettledView | ChatGPTPendingView
+
+
+class ChatGPTAuthorizationStart(Enum):
+    STARTED = auto()
+    ALREADY_ACTIVE = auto()
+    FAILED = auto()
 
 
 class ChatGPTSetupStore:
@@ -135,16 +142,16 @@ class ChatGPTSetup:
             self._store.fail_connected()
             raise
 
-    async def connect(self) -> bool:
+    async def start_authorization(self) -> ChatGPTAuthorizationStart:
         async with self._connect_lock:
             state = self._store.view()
             if isinstance(state, ChatGPTPendingView) or state.status == "connected":
-                return True
+                return ChatGPTAuthorizationStart.ALREADY_ACTIVE
             try:
                 authorization = await self._codex.start_device_authorization()
             except CodexOnboardingError:
                 self._store.fail_to_start()
-                return False
+                return ChatGPTAuthorizationStart.FAILED
             try:
                 started = self._store.begin(authorization)
             except SetupStateError:
@@ -154,12 +161,12 @@ class ChatGPTSetup:
             if not started:
                 with suppress(CodexOnboardingError):
                     await self._codex.cancel(authorization.login_id)
-                return True
+                return ChatGPTAuthorizationStart.ALREADY_ACTIVE
             self._completion_task = asyncio.create_task(
                 self._complete(authorization.login_id),
                 name="poppy-chatgpt-login",
             )
-            return True
+            return ChatGPTAuthorizationStart.STARTED
 
     async def close(self) -> None:
         await self._stop_completion_task()
