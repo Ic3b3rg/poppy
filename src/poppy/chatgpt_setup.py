@@ -48,6 +48,12 @@ class ChatGPTAuthorizationStart(Enum):
     FAILED = auto()
 
 
+@dataclass(slots=True)
+class _CancellationInProgress:
+    login_id: str
+    completion_failed: bool = False
+
+
 class ChatGPTSetupStore:
     def __init__(self, *, data_dir: Path) -> None:
         self._state_file = data_dir / CHATGPT_SETUP_STATE_FILE
@@ -127,8 +133,7 @@ class ChatGPTSetup:
         self._codex = codex
         self._completion_task: asyncio.Task[None] | None = None
         self._connect_lock = asyncio.Lock()
-        self._cancelling_login_id: str | None = None
-        self._completion_failures_during_cancel: set[str] = set()
+        self._cancellation: _CancellationInProgress | None = None
 
     def view(self) -> ChatGPTSetupView:
         return self._store.view()
@@ -177,12 +182,13 @@ class ChatGPTSetup:
             if not isinstance(state, ChatGPTPendingView):
                 return False
             login_id = state.authorization.login_id
-            self._cancelling_login_id = login_id
+            cancellation = _CancellationInProgress(login_id=login_id)
+            self._cancellation = cancellation
             try:
                 try:
                     await self._codex.cancel(login_id)
                 except CodexOnboardingError:
-                    if login_id in self._completion_failures_during_cancel:
+                    if cancellation.completion_failed:
                         self._store.fail(login_id)
                     raise
                 cancelled = self._store.cancel(login_id)
@@ -190,8 +196,7 @@ class ChatGPTSetup:
                     await self._stop_completion_task()
                 return cancelled
             finally:
-                self._cancelling_login_id = None
-                self._completion_failures_during_cancel.discard(login_id)
+                self._cancellation = None
 
     async def _stop_completion_task(self) -> None:
         task = self._completion_task
@@ -206,8 +211,9 @@ class ChatGPTSetup:
         try:
             await self._codex.wait_for_completion(login_id)
         except CodexOnboardingError:
-            if self._cancelling_login_id == login_id:
-                self._completion_failures_during_cancel.add(login_id)
+            cancellation = self._cancellation
+            if cancellation is not None and cancellation.login_id == login_id:
+                cancellation.completion_failed = True
                 return
             self._store.fail(login_id)
             return
