@@ -8,11 +8,7 @@ from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
-import httpx
 import pytest
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
-from fastapi import FastAPI
 from openai_codex import AsyncCodex
 
 from poppy.adapters.codex_onboarding import (
@@ -22,10 +18,17 @@ from poppy.adapters.codex_onboarding import (
     CodexUnsupportedAccountError,
 )
 from poppy.adapters.github_onboarding import GitHubAppCredentials, GitHubInstallation
-from poppy.config import PoppySettings
 from poppy.github_setup import GitHubSetupStore
 from poppy.runtime import ReviewerAdapters, ReviewerConnection
 from poppy.service import RuntimeConfigurationError, create_service
+from tests.onboarding_support import (
+    establish_setup_session,
+    github_private_key,
+    setup_client,
+    setup_settings,
+    wait_for_mode,
+    wait_for_setup_text,
+)
 
 
 @pytest.mark.asyncio
@@ -79,7 +82,7 @@ async def test_success_is_connected_without_github_and_survives_restart(
             headers={"origin": "https://poppy.example"},
         )
         codex.complete()
-        connected_page = await wait_for_page_text(client, "Connected")
+        connected_page = await wait_for_setup_text(client, "Connected")
         github_after_chatgpt = await client.post(
             "/setup/github/connect",
             data={"csrf_token": csrf_token},
@@ -135,7 +138,7 @@ async def test_persisted_connected_marker_is_failed_when_codex_rejects_the_accou
             headers={"origin": "https://poppy.example"},
         )
         first_codex.complete()
-        await wait_for_page_text(client, "Connected")
+        await wait_for_setup_text(client, "Connected")
         session_cookie = client.cookies.get("poppy_setup_session")
 
     provider_detail = "persisted account provider detail"
@@ -194,7 +197,7 @@ async def test_chatgpt_can_connect_after_github_is_already_connected(
             headers={"origin": "https://poppy.example"},
         )
         codex.complete()
-        reviewer_health = await wait_for_reviewer_mode(client)
+        reviewer_health = await wait_for_mode(client, "reviewer")
         closed_setup = await client.get("/setup")
 
     assert re.search(r"<dt>GitHub</dt>\s*<dd>Connected</dd>", github_first_page.text)
@@ -231,7 +234,7 @@ async def test_failed_authorization_is_not_connected_and_can_be_retried_safely(
         )
         pending_page = await client.get("/setup")
         codex.complete()
-        connected_page = await wait_for_page_text(client, "Connected")
+        connected_page = await wait_for_setup_text(client, "Connected")
 
     assert failed.status_code == 303
     assert "Failed" in failed_page.text
@@ -383,7 +386,7 @@ async def test_failed_and_non_chatgpt_completions_never_become_connected(
             headers={"origin": "https://poppy.example"},
         )
         codex.complete(failure)
-        failed_page = await wait_for_page_text(client, "Failed")
+        failed_page = await wait_for_setup_text(client, "Failed")
 
     assert "Connected" not in failed_page.text
     assert "Retry ChatGPT" in failed_page.text
@@ -483,7 +486,7 @@ async def test_success_winning_a_cancel_race_cannot_be_overwritten(
         )
         await codex.cancel_started.wait()
         codex.complete()
-        await wait_for_page_text(client, "Connected")
+        await wait_for_setup_text(client, "Connected")
         cancel_release.set()
         cancelled = await cancel_request
         final_page = await client.get("/setup")
@@ -672,16 +675,6 @@ class FakeReviewerAdapterFactory:
         return ReviewerAdapters(github=MagicMock(), codex=MagicMock())
 
 
-def setup_settings(tmp_path: Path) -> PoppySettings:
-    return PoppySettings(
-        public_base_url="https://poppy.example",
-        data_dir=tmp_path / "data",
-        codex_home=tmp_path / "data" / "codex",
-        codex_workspace=tmp_path / "workspace",
-        _env_file=None,
-    )
-
-
 def seed_connected_github(data_dir: Path) -> None:
     data_dir.mkdir(mode=0o700)
     store = GitHubSetupStore(data_dir=data_dir)
@@ -710,51 +703,3 @@ def seed_connected_github(data_dir: Path) -> None:
             target_type="User",
         ),
     )
-
-
-def github_private_key() -> str:
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    return key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
-    ).decode()
-
-
-async def establish_setup_session(
-    client: httpx.AsyncClient,
-    caplog: pytest.LogCaptureFixture,
-) -> str:
-    match = re.search(r"Poppy Setup Session: (https:\/\/\S+)", caplog.text)
-    assert match is not None
-    exchange = await client.get(match.group(1))
-    page = await client.get(exchange.headers["location"])
-    csrf_token = re.search(r'<meta name="csrf-token" content="([^"]+)">', page.text)
-    assert csrf_token is not None
-    return csrf_token.group(1)
-
-
-def setup_client(app: FastAPI) -> httpx.AsyncClient:
-    return httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app),
-        base_url="https://poppy.example",
-        follow_redirects=False,
-    )
-
-
-async def wait_for_page_text(client: httpx.AsyncClient, expected: str) -> httpx.Response:
-    for _ in range(20):
-        page = await client.get("/setup")
-        if expected in page.text:
-            return page
-        await asyncio.sleep(0)
-    raise AssertionError(f"setup page did not contain {expected!r}")
-
-
-async def wait_for_reviewer_mode(client: httpx.AsyncClient) -> httpx.Response:
-    for _ in range(20):
-        health = await client.get("/healthz")
-        if health.json().get("mode") == "reviewer":
-            return health
-        await asyncio.sleep(0)
-    raise AssertionError("Poppy did not enter reviewer mode")

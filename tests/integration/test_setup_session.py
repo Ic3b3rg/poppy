@@ -7,12 +7,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-import httpx
 import pytest
-from fastapi import FastAPI
 
 from poppy.config import PoppySettings
 from poppy.service import RuntimeConfigurationError, create_service
+from tests.onboarding_support import setup_client, setup_settings, setup_url_from
 
 
 @pytest.mark.asyncio
@@ -398,30 +397,6 @@ def test_malformed_or_impossible_persisted_state_fails_closed(
 
     with pytest.raises(RuntimeConfigurationError, match="setup state"):
         create_service(configured)
-
-
-def setup_settings(tmp_path: Path) -> PoppySettings:
-    return PoppySettings(
-        public_base_url="https://poppy.example",
-        data_dir=tmp_path / "data",
-        codex_home=tmp_path / "data" / "codex",
-        codex_workspace=tmp_path / "workspace",
-        _env_file=None,
-    )
-
-
-def setup_url_from(caplog: pytest.LogCaptureFixture) -> str:
-    match = re.search(r"Poppy Setup Session: (https://\S+)", caplog.text)
-    assert match is not None
-    return match.group(1)
-
-
-def setup_client(app: FastAPI) -> httpx.AsyncClient:
-    return httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app),
-        base_url="https://poppy.example",
-        follow_redirects=False,
-    )
 
 
 @dataclass

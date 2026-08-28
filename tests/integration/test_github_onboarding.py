@@ -10,11 +10,15 @@ import httpx
 import jwt
 import pytest
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
-from fastapi import FastAPI
 
-from poppy.config import PoppySettings
 from poppy.service import RuntimeConfigurationError, create_service
+from tests.onboarding_support import (
+    establish_setup_session,
+    github_private_key,
+    manifest_state_from,
+    setup_client,
+    setup_settings,
+)
 
 
 @pytest.mark.asyncio
@@ -876,35 +880,6 @@ async def test_installation_callback_rejects_invalid_or_ambiguous_correlation(
     ] == [404, 404, 404, 404, 404]
 
 
-def setup_settings(tmp_path: Path) -> PoppySettings:
-    return PoppySettings(
-        public_base_url="https://poppy.example",
-        data_dir=tmp_path / "data",
-        codex_home=tmp_path / "data" / "codex",
-        codex_workspace=tmp_path / "workspace",
-        _env_file=None,
-    )
-
-
-async def establish_setup_session(
-    client: httpx.AsyncClient,
-    caplog: pytest.LogCaptureFixture,
-) -> str:
-    match = re.search(r"Poppy Setup Session: (https://\S+)", caplog.text)
-    assert match is not None
-    exchange = await client.get(match.group(1))
-    page = await client.get(exchange.headers["location"])
-    csrf_token = re.search(r'<meta name="csrf-token" content="([^"]+)">', page.text)
-    assert csrf_token is not None
-    return csrf_token.group(1)
-
-
-def manifest_state_from(response: httpx.Response) -> str:
-    action = re.search(r'<form action="([^"]+)" method="post">', response.text)
-    assert action is not None
-    return parse_qs(urlparse(html.unescape(action.group(1))).query)["state"][0]
-
-
 def manifest_from(response: httpx.Response) -> dict[str, object]:
     manifest_input = re.search(
         r'<input type="hidden" name="manifest" value="([^"]+)">',
@@ -916,23 +891,6 @@ def manifest_from(response: httpx.Response) -> dict[str, object]:
     return manifest
 
 
-def github_private_key() -> str:
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    return key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
-    ).decode()
-
-
 def github_public_key(private_key: str) -> object:
     loaded = serialization.load_pem_private_key(private_key.encode(), password=None)
     return loaded.public_key()
-
-
-def setup_client(app: FastAPI) -> httpx.AsyncClient:
-    return httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app),
-        base_url="https://poppy.example",
-        follow_redirects=False,
-    )
