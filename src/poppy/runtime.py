@@ -184,13 +184,11 @@ class InstanceRuntime:
                 connection = self._read_connection()
                 if connection is None:
                     raise RuntimeStateError("Ready Poppy credentials are incomplete")
-                active = await self._build_reviewer(connection)
-                try:
-                    self._setup_session.close()
-                except SetupStateError as error:
-                    await active.close()
-                    raise RuntimeStateError("Poppy Setup Session could not be closed") from error
-                self._active = active
+                await self._activate_reviewer(
+                    connection,
+                    persist_readiness=False,
+                    failure_message="Poppy Setup Session could not be closed",
+                )
             return
         await self.promote_if_ready()
 
@@ -202,16 +200,11 @@ class InstanceRuntime:
             if connection is None:
                 return False
 
-            active = await self._build_reviewer(connection)
-            try:
-                async with self._setup_gate.promotion():
-                    self._readiness.mark_ready()
-                    self._setup_closed = True
-                    self._setup_session.close()
-            except (RuntimeStateError, SetupStateError) as error:
-                await active.close()
-                raise RuntimeStateError("Poppy promotion could not be persisted") from error
-            self._active = active
+            await self._activate_reviewer(
+                connection,
+                persist_readiness=True,
+                failure_message="Poppy promotion could not be persisted",
+            )
             return True
 
     async def close(self) -> None:
@@ -238,6 +231,27 @@ class InstanceRuntime:
             scheduler=scheduler,
             close_scheduler=scheduler.close,
         )
+
+    async def _activate_reviewer(
+        self,
+        connection: ReviewerConnection,
+        *,
+        persist_readiness: bool,
+        failure_message: str,
+    ) -> None:
+        active = await self._build_reviewer(connection)
+        try:
+            if persist_readiness:
+                async with self._setup_gate.promotion():
+                    self._readiness.mark_ready()
+                    self._setup_closed = True
+                    self._setup_session.close()
+            else:
+                self._setup_session.close()
+        except (RuntimeStateError, SetupStateError) as error:
+            await active.close()
+            raise RuntimeStateError(failure_message) from error
+        self._active = active
 
     def _read_connection(self) -> ReviewerConnection | None:
         try:
