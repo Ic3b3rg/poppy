@@ -4,7 +4,7 @@ import logging
 import re
 import secrets
 from typing import Protocol
-from urllib.parse import parse_qs, urlencode
+from urllib.parse import parse_qs
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -20,6 +20,7 @@ from poppy.github_setup import (
     GitHubSetupView,
     github_app_manifest,
     installation_url,
+    manifest_registration_url,
 )
 from poppy.setup_session import SetupSessionStore, SetupStateError
 from poppy.webhook import InvalidWebhook, normalize_pull_request_webhook, verify_signature
@@ -27,6 +28,7 @@ from poppy.webhook import InvalidWebhook, normalize_pull_request_webhook, verify
 MAX_WEBHOOK_BYTES = 1_000_000
 MAX_SETUP_FORM_BYTES = 16_384
 SETUP_SESSION_COOKIE = "poppy_setup_session"
+_GITHUB_ACCOUNT_PATTERN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?")
 
 logger = logging.getLogger(__name__)
 
@@ -175,14 +177,26 @@ def create_setup_app(
         return JSONResponse({"error": "reviewer unavailable"}, status_code=503)
 
     @app.post("/setup/github/connect")
-    async def connect_github() -> Response:
+    async def connect_github(request: Request) -> Response:
+        try:
+            organization = _github_organization(request)
+        except ValueError:
+            return JSONResponse({"error": "invalid GitHub organization"}, status_code=400)
         view = github_setup.view()
         if view.status == "connected":
             return JSONResponse({"error": "GitHub is already connected"}, status_code=409)
         if view.pending is not None:
             return RedirectResponse(installation_url(view.pending), status_code=303)
-        correlation_state = github_setup.begin_manifest()
-        action = "https://github.com/settings/apps/new?" + urlencode({"state": correlation_state})
+        registration = github_setup.begin_manifest(organization=organization)
+        if registration is None:
+            return JSONResponse(
+                {"error": "GitHub App registration is already in progress"},
+                status_code=409,
+            )
+        action = manifest_registration_url(
+            correlation_state=registration.correlation_state,
+            organization=registration.organization,
+        )
         manifest = json.dumps(
             github_app_manifest(expected_origin),
             separators=(",", ":"),
@@ -215,6 +229,7 @@ def create_setup_app(
         try:
             app_credentials = await github_onboarding.exchange_manifest(code)
         except GitHubOnboardingError:
+            github_setup.retry_manifest_registration()
             logger.warning(
                 "GitHub App registration failed",
                 extra={"event": "github_manifest_exchange_failed"},
@@ -289,6 +304,10 @@ def _github_connection_html(view: GitHubSetupView, *, csrf_token: str) -> str:
         "Not connected"
         '<form action="/setup/github/connect" method="post">'
         f'<input type="hidden" name="csrf_token" value="{html.escape(csrf_token, quote=True)}">'
+        "<label>GitHub organization (optional) "
+        '<input name="organization" maxlength="39" '
+        'pattern="[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?" '
+        'autocomplete="off" autocapitalize="none" spellcheck="false"></label>'
         '<button type="submit">Connect GitHub</button>'
         "</form>"
     )
@@ -310,8 +329,24 @@ async def _setup_form_csrf_token(request: Request) -> str | None:
         )
     except (UnicodeDecodeError, ValueError):
         return None
+    request.state.setup_form_values = values
     csrf_tokens = values.get("csrf_token", [])
     return csrf_tokens[0] if len(csrf_tokens) == 1 else None
+
+
+def _github_organization(request: Request) -> str | None:
+    values: dict[str, list[str]] | None = getattr(request.state, "setup_form_values", None)
+    if values is None or "organization" not in values:
+        return None
+    organizations = values["organization"]
+    if len(organizations) != 1:
+        raise ValueError("ambiguous GitHub organization")
+    organization = organizations[0]
+    if organization == "":
+        return None
+    if _GITHUB_ACCOUNT_PATTERN.fullmatch(organization) is None:
+        raise ValueError("invalid GitHub organization")
+    return organization
 
 
 def _protect_setup_response(response: Response) -> Response:

@@ -1,15 +1,19 @@
 import hashlib
 import hmac
 import json
-import os
 import re
 import secrets
-import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
+
+from poppy.private_state import (
+    PrivateStateFileNotRegularError,
+    read_private_json,
+    write_private_json_atomically,
+)
 
 TOKEN_BYTES = 32
 STATE_FILE_NAME = "setup-state.json"
@@ -119,42 +123,20 @@ class SetupSessionStore:
 
     def _read_state(self) -> SetupState:
         try:
-            if self._state_file.is_symlink() or not self._state_file.is_file():
-                raise SetupStateError("Setup Session state is not a regular file")
-            self._state_file.chmod(0o600)
-            payload: Any = json.loads(self._state_file.read_text(encoding="utf-8"))
+            payload: Any = read_private_json(self._state_file)
             return _parse_state(payload)
+        except PrivateStateFileNotRegularError as error:
+            raise SetupStateError("Setup Session state is not a regular file") from error
         except SetupStateError:
             raise
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
             raise SetupStateError("Setup Session state is not readable") from error
 
     def _write_state(self, state: SetupState) -> None:
-        directory = self._state_file.parent
-        temporary_path: Path | None = None
         try:
-            file_descriptor, raw_temporary_path = tempfile.mkstemp(
-                dir=directory,
-                prefix=f".{STATE_FILE_NAME}.",
-            )
-            temporary_path = Path(raw_temporary_path)
-            with os.fdopen(file_descriptor, "w", encoding="utf-8") as temporary_file:
-                json.dump(_serialize_state(state), temporary_file, separators=(",", ":"))
-                temporary_file.flush()
-                os.fsync(temporary_file.fileno())
-            os.chmod(temporary_path, 0o600)
-            os.replace(temporary_path, self._state_file)
-            directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-            directory_descriptor = os.open(directory, directory_flags)
-            try:
-                os.fsync(directory_descriptor)
-            finally:
-                os.close(directory_descriptor)
+            write_private_json_atomically(self._state_file, _serialize_state(state))
         except OSError as error:
             raise SetupStateError("Setup Session state cannot be persisted") from error
-        finally:
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
 
 
 def _new_setup_state(

@@ -1,3 +1,4 @@
+import asyncio
 import html
 import json
 import logging
@@ -48,7 +49,7 @@ async def test_connect_github_starts_the_exact_private_app_manifest(
     assert manifest_url.path == "/settings/apps/new"
     assert len(parse_qs(manifest_url.query)["state"][0]) >= 43
     assert manifest == {
-        "name": "Poppy",
+        "name": "Poppy e6ac4672765c",
         "url": "https://poppy.example",
         "hook_attributes": {
             "url": "https://poppy.example/webhooks/github",
@@ -66,6 +67,117 @@ async def test_connect_github_starts_the_exact_private_app_manifest(
         "default_events": ["pull_request"],
     }
     assert "https://github.com" in response.headers["content-security-policy"]
+
+
+@pytest.mark.asyncio
+async def test_connect_github_can_register_the_private_app_for_an_organization(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="poppy.service")
+    app = create_service(setup_settings(tmp_path))
+
+    async with setup_client(app) as client:
+        csrf_token = await establish_setup_session(client, caplog)
+        response = await client.post(
+            "/setup/github/connect",
+            data={"csrf_token": csrf_token, "organization": "operator-org"},
+            headers={"origin": "https://poppy.example"},
+        )
+
+    assert response.status_code == 200
+    action = re.search(r'<form action="([^"]+)" method="post">', response.text)
+    assert action is not None
+    manifest_url = urlparse(html.unescape(action.group(1)))
+    assert manifest_url.scheme == "https"
+    assert manifest_url.netloc == "github.com"
+    assert manifest_url.path == "/organizations/operator-org/settings/apps/new"
+    assert len(parse_qs(manifest_url.query)["state"][0]) >= 43
+
+
+@pytest.mark.asyncio
+async def test_repeated_connect_does_not_replace_the_active_manifest_state(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="poppy.service")
+    app = create_service(setup_settings(tmp_path))
+
+    async with setup_client(app) as client:
+        csrf_token = await establish_setup_session(client, caplog)
+        first = await client.post(
+            "/setup/github/connect",
+            data={"csrf_token": csrf_token},
+            headers={"origin": "https://poppy.example"},
+        )
+        repeated = await client.post(
+            "/setup/github/connect",
+            data={"csrf_token": csrf_token},
+            headers={"origin": "https://poppy.example"},
+        )
+
+    assert first.status_code == 200
+    assert repeated.status_code == 200
+    assert manifest_state_from(repeated) == manifest_state_from(first)
+
+
+@pytest.mark.asyncio
+async def test_connect_cannot_replace_a_manifest_exchange_in_progress(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    exchange_started = asyncio.Event()
+    finish_exchange = asyncio.Event()
+    private_key = github_private_key()
+
+    async def github(_request: httpx.Request) -> httpx.Response:
+        exchange_started.set()
+        await finish_exchange.wait()
+        return httpx.Response(
+            201,
+            json={
+                "id": 123,
+                "slug": "poppy-example",
+                "pem": private_key,
+                "webhook_secret": "generated-webhook-secret",
+            },
+        )
+
+    provider_client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(github),
+    )
+    caplog.set_level(logging.WARNING, logger="poppy.service")
+    app = create_service(
+        setup_settings(tmp_path),
+        github_onboarding_client=provider_client,
+    )
+
+    async with provider_client, setup_client(app) as client:
+        csrf_token = await establish_setup_session(client, caplog)
+        start = await client.post(
+            "/setup/github/connect",
+            data={"csrf_token": csrf_token, "organization": "operator-org"},
+            headers={"origin": "https://poppy.example"},
+        )
+        callback_task = asyncio.create_task(
+            client.get(
+                "/setup/github/manifest/callback",
+                params={"code": "manifest-code", "state": manifest_state_from(start)},
+            )
+        )
+        await exchange_started.wait()
+        repeated = await client.post(
+            "/setup/github/connect",
+            data={"csrf_token": csrf_token},
+            headers={"origin": "https://poppy.example"},
+        )
+        finish_exchange.set()
+        callback = await callback_task
+
+    assert repeated.status_code == 409
+    assert repeated.json() == {"error": "GitHub App registration is already in progress"}
+    assert callback.status_code == 303
 
 
 @pytest.mark.asyncio
@@ -107,7 +219,7 @@ async def test_manifest_callback_exchanges_once_and_redirects_without_exposing_c
         csrf_token = await establish_setup_session(client, caplog)
         start = await client.post(
             "/setup/github/connect",
-            data={"csrf_token": csrf_token},
+            data={"csrf_token": csrf_token, "organization": "operator-org"},
             headers={"origin": "https://poppy.example"},
         )
         state = manifest_state_from(start)
@@ -328,7 +440,7 @@ async def test_installation_callback_verifies_the_new_app_and_survives_restart(
         csrf_token = await establish_setup_session(client, caplog)
         start = await client.post(
             "/setup/github/connect",
-            data={"csrf_token": csrf_token},
+            data={"csrf_token": csrf_token, "organization": "operator-org"},
             headers={"origin": "https://poppy.example"},
         )
         manifest_callback = await client.get(
@@ -511,7 +623,7 @@ async def test_unrelated_or_malformed_installation_is_retryable_and_never_connec
         csrf_token = await establish_setup_session(client, caplog)
         start = await client.post(
             "/setup/github/connect",
-            data={"csrf_token": csrf_token},
+            data={"csrf_token": csrf_token, "organization": "operator-org"},
             headers={"origin": "https://poppy.example"},
         )
         manifest_callback = await client.get(

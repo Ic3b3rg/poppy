@@ -1,13 +1,18 @@
+import hashlib
 import json
-import os
 import re
 import secrets
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import quote, urlencode
 
 from poppy.adapters.github_onboarding import GitHubAppCredentials, GitHubInstallation
+from poppy.private_state import (
+    PrivateStateFileNotRegularError,
+    read_private_json,
+    write_private_json_atomically,
+)
 from poppy.setup_session import SetupStateError
 
 GITHUB_SETUP_STATE_FILE = "github-setup.json"
@@ -21,6 +26,12 @@ class PendingInstallation:
 
 
 @dataclass(frozen=True, slots=True)
+class ManifestRegistration:
+    correlation_state: str
+    organization: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class GitHubSetupView:
     status: Literal["disconnected", "installation", "connected"]
     pending: PendingInstallation | None = None
@@ -31,8 +42,14 @@ class GitHubSetupStore:
         self._state_file = data_dir / GITHUB_SETUP_STATE_FILE
 
     def initialize(self) -> None:
-        if self._state_file.exists():
-            self.view()
+        if not self._state_file.exists():
+            return
+        payload = self._read_state()
+        if payload.get("phase") == "exchange":
+            _parse_exchange(payload)
+            self._write_retryable_registration()
+            return
+        self.view()
 
     def view(self) -> GitHubSetupView:
         if not self._state_file.exists():
@@ -45,6 +62,9 @@ class GitHubSetupStore:
         if phase == "exchange":
             _parse_exchange(payload)
             return GitHubSetupView(status="disconnected")
+        if phase == "registration_retry":
+            _parse_registration_retry(payload)
+            return GitHubSetupView(status="disconnected")
         if phase == "installation":
             return GitHubSetupView(status="installation", pending=_parse_pending(payload))
         if phase == "connected":
@@ -52,24 +72,45 @@ class GitHubSetupStore:
             return GitHubSetupView(status="connected")
         raise SetupStateError("GitHub setup state has an unsupported phase")
 
-    def begin_manifest(self) -> str:
+    def begin_manifest(self, *, organization: str | None) -> ManifestRegistration | None:
+        if self._state_file.exists():
+            payload = self._read_state()
+            if payload.get("phase") == "manifest":
+                return _parse_manifest(payload)
+            if payload.get("phase") == "exchange":
+                _parse_exchange(payload)
+                return None
+            if payload.get("phase") != "registration_retry":
+                _validate_payload(payload)
+                raise SetupStateError("GitHub setup state cannot start App registration")
+            _parse_registration_retry(payload)
         state = secrets.token_urlsafe(32)
+        registration = ManifestRegistration(
+            correlation_state=state,
+            organization=organization,
+        )
         self._write_state(
             {
                 "version": 1,
                 "phase": "manifest",
                 "manifest_state": state,
+                "organization": organization,
             }
         )
-        return state
+        return registration
+
+    def retry_manifest_registration(self) -> None:
+        payload = self._read_state()
+        _parse_exchange(payload)
+        self._write_retryable_registration()
 
     def consume_manifest(self, presented_state: str) -> bool:
         payload = self._read_state()
         if payload.get("phase") != "manifest":
             _validate_payload(payload)
             return False
-        correlation_state = _parse_manifest(payload)
-        if not secrets.compare_digest(correlation_state, presented_state):
+        registration = _parse_manifest(payload)
+        if not secrets.compare_digest(registration.correlation_state, presented_state):
             return False
         self._write_state({"version": 1, "phase": "exchange"})
         return True
@@ -142,12 +183,14 @@ class GitHubSetupStore:
             }
         )
 
+    def _write_retryable_registration(self) -> None:
+        self._write_state({"version": 1, "phase": "registration_retry"})
+
     def _read_state(self) -> dict[str, Any]:
         try:
-            if self._state_file.is_symlink() or not self._state_file.is_file():
-                raise SetupStateError("GitHub setup state is not a regular file")
-            self._state_file.chmod(0o600)
-            payload: Any = json.loads(self._state_file.read_text(encoding="utf-8"))
+            payload: Any = read_private_json(self._state_file)
+        except PrivateStateFileNotRegularError as error:
+            raise SetupStateError("GitHub setup state is not a regular file") from error
         except SetupStateError:
             raise
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
@@ -157,36 +200,17 @@ class GitHubSetupStore:
         return payload
 
     def _write_state(self, payload: dict[str, object]) -> None:
-        directory = self._state_file.parent
-        temporary_path: Path | None = None
         try:
-            file_descriptor, raw_temporary_path = tempfile.mkstemp(
-                dir=directory,
-                prefix=f".{GITHUB_SETUP_STATE_FILE}.",
-            )
-            temporary_path = Path(raw_temporary_path)
-            with os.fdopen(file_descriptor, "w", encoding="utf-8") as temporary_file:
-                json.dump(payload, temporary_file, separators=(",", ":"))
-                temporary_file.flush()
-                os.fsync(temporary_file.fileno())
-            os.chmod(temporary_path, 0o600)
-            os.replace(temporary_path, self._state_file)
-            directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-            directory_descriptor = os.open(directory, directory_flags)
-            try:
-                os.fsync(directory_descriptor)
-            finally:
-                os.close(directory_descriptor)
+            write_private_json_atomically(self._state_file, payload)
         except OSError as error:
             raise SetupStateError("GitHub setup state cannot be persisted") from error
-        finally:
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
 
 
 def github_app_manifest(public_origin: str) -> dict[str, object]:
     return {
-        "name": "Poppy",
+        # GitHub App names are globally unique, so derive a stable per-instance default.
+        # https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/registering-a-github-app#registering-a-github-app
+        "name": f"Poppy {hashlib.sha256(public_origin.encode()).hexdigest()[:12]}",
         "url": public_origin,
         "hook_attributes": {
             "url": f"{public_origin}/webhooks/github",
@@ -210,6 +234,20 @@ def installation_url(pending: PendingInstallation) -> str:
         f"https://github.com/apps/{pending.app.slug}/installations/new?"
         f"state={pending.correlation_state}"
     )
+
+
+def manifest_registration_url(
+    *,
+    correlation_state: str,
+    organization: str | None,
+) -> str:
+    # Private Apps must be registered on the account where they will be installed.
+    # https://docs.github.com/en/apps/sharing-github-apps/registering-a-github-app-from-a-manifest#1-you-redirect-people-to-github-to-register-a-new-github-app
+    if organization is None:
+        path = "/settings/apps/new"
+    else:
+        path = f"/organizations/{quote(organization, safe='')}/settings/apps/new"
+    return f"https://github.com{path}?{urlencode({'state': correlation_state})}"
 
 
 def _serialize_app(app: GitHubAppCredentials) -> dict[str, object]:
@@ -295,8 +333,8 @@ def _parse_app(payload: Any) -> GitHubAppCredentials:
         raise SetupStateError("GitHub App credentials are invalid") from error
 
 
-def _parse_manifest(payload: dict[str, Any]) -> str:
-    if set(payload) != {"version", "phase", "manifest_state"}:
+def _parse_manifest(payload: dict[str, Any]) -> ManifestRegistration:
+    if set(payload) != {"version", "phase", "manifest_state", "organization"}:
         raise SetupStateError("GitHub manifest state has an unsupported format")
     _require_version(payload)
     if payload["phase"] != "manifest":
@@ -307,12 +345,23 @@ def _parse_manifest(payload: dict[str, Any]) -> str:
         or _CORRELATION_PATTERN.fullmatch(correlation_state) is None
     ):
         raise SetupStateError("GitHub manifest state has an invalid correlation value")
-    return correlation_state
+    organization = payload["organization"]
+    if organization is not None and not isinstance(organization, str):
+        raise SetupStateError("GitHub manifest state has an invalid organization")
+    return ManifestRegistration(
+        correlation_state=correlation_state,
+        organization=organization,
+    )
 
 
 def _parse_exchange(payload: dict[str, Any]) -> None:
     if payload != {"version": 1, "phase": "exchange"}:
         raise SetupStateError("GitHub exchange state has an unsupported format")
+
+
+def _parse_registration_retry(payload: dict[str, Any]) -> None:
+    if payload != {"version": 1, "phase": "registration_retry"}:
+        raise SetupStateError("GitHub registration retry state has an unsupported format")
 
 
 def _require_version(payload: dict[str, Any]) -> None:
@@ -327,6 +376,9 @@ def _validate_payload(payload: dict[str, Any]) -> None:
         return
     if phase == "exchange":
         _parse_exchange(payload)
+        return
+    if phase == "registration_retry":
+        _parse_registration_retry(payload)
         return
     if phase == "installation":
         _parse_pending(payload)
