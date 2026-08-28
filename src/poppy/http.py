@@ -13,8 +13,10 @@ from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import Response
 from starlette.types import Lifespan
 
+from poppy.adapters.codex_onboarding import CodexOnboardingError
 from poppy.adapters.github_onboarding import GitHubOnboarding, GitHubOnboardingError
 from poppy.application.review_cycle import ReviewRequest
+from poppy.chatgpt_setup import ChatGPTSetup, ChatGPTSetupView
 from poppy.github_setup import (
     GitHubOrganization,
     GitHubSetupStore,
@@ -38,6 +40,7 @@ SETUP_PAGE = """<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="csrf-token" content="{csrf_token}">
+  {chatgpt_refresh}
   <title>Set up Poppy</title>
 </head>
 <body>
@@ -50,7 +53,10 @@ SETUP_PAGE = """<!doctype html>
         <dt>GitHub</dt>
         <dd>{github_connection}</dd>
         <dt>ChatGPT</dt>
-        <dd>Not connected</dd>
+        <dd>
+          {chatgpt_connection}
+          <p>Connect a ChatGPT account. API keys are not supported.</p>
+        </dd>
       </dl>
     </section>
   </main>
@@ -88,6 +94,7 @@ def create_setup_app(
     setup_session: SetupSessionStore,
     github_setup: GitHubSetupStore,
     github_onboarding: GitHubOnboarding,
+    chatgpt_setup: ChatGPTSetup,
     public_base_url: HttpUrl,
     lifespan: Lifespan[FastAPI] | None = None,
 ) -> FastAPI:
@@ -149,8 +156,17 @@ def create_setup_app(
                 return _protect_setup_response(unavailable_response)
             page = SETUP_PAGE.format(
                 csrf_token=html.escape(csrf_token, quote=True),
+                chatgpt_refresh=(
+                    '<meta http-equiv="refresh" content="2; url=/setup">'
+                    if chatgpt_setup.view().status == "pending"
+                    else ""
+                ),
                 github_connection=_github_connection_html(
                     github_setup.view(),
+                    csrf_token=csrf_token,
+                ),
+                chatgpt_connection=_chatgpt_connection_html(
+                    chatgpt_setup.view(),
                     csrf_token=csrf_token,
                 ),
             )
@@ -221,6 +237,35 @@ def create_setup_app(
             f"script-src 'nonce-{script_nonce}'"
         )
         return response
+
+    @app.post("/setup/chatgpt/connect")
+    async def connect_chatgpt() -> Response:
+        if not await chatgpt_setup.connect():
+            logger.warning(
+                "ChatGPT authorization could not be started",
+                extra={"event": "chatgpt_authorization_start_failed"},
+            )
+        return RedirectResponse("/setup", status_code=303)
+
+    @app.post("/setup/chatgpt/cancel")
+    async def cancel_chatgpt() -> Response:
+        try:
+            cancelled = await chatgpt_setup.cancel()
+        except CodexOnboardingError:
+            logger.warning(
+                "ChatGPT authorization could not be cancelled",
+                extra={"event": "chatgpt_authorization_cancel_failed"},
+            )
+            return JSONResponse(
+                {"error": "ChatGPT authorization could not be cancelled; retry from setup"},
+                status_code=502,
+            )
+        if not cancelled:
+            return JSONResponse(
+                {"error": "ChatGPT authorization is not pending"},
+                status_code=409,
+            )
+        return RedirectResponse("/setup", status_code=303)
 
     @app.get("/setup/github/manifest/callback")
     async def github_manifest_callback(request: Request) -> Response:
@@ -329,6 +374,30 @@ def _github_connection_html(view: GitHubSetupView, *, csrf_token: str) -> str:
         'pattern="[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?" '
         'autocomplete="off" autocapitalize="none" spellcheck="false"></label>'
         '<button type="submit">Connect GitHub</button>'
+        "</form>"
+    )
+
+
+def _chatgpt_connection_html(view: ChatGPTSetupView, *, csrf_token: str) -> str:
+    if view.status == "connected":
+        return "Success. Connected"
+    if view.status == "pending" and view.authorization is not None:
+        return (
+            "Pending. Open "
+            f'<a href="{html.escape(view.authorization.verification_url, quote=True)}">'
+            "the ChatGPT verification page</a> and enter code "
+            f"<code>{html.escape(view.authorization.user_code)}</code>."
+            '<form action="/setup/chatgpt/cancel" method="post">'
+            f'<input type="hidden" name="csrf_token" value="{html.escape(csrf_token, quote=True)}">'
+            '<button type="submit">Cancel ChatGPT</button>'
+            "</form>"
+        )
+    button = "Retry ChatGPT" if view.status in {"failed", "cancelled"} else "Connect ChatGPT"
+    return (
+        f"{view.status.capitalize() if view.status != 'disconnected' else 'Not connected'}"
+        '<form action="/setup/chatgpt/connect" method="post">'
+        f'<input type="hidden" name="csrf_token" value="{html.escape(csrf_token, quote=True)}">'
+        f'<button type="submit">{button}</button>'
         "</form>"
     )
 

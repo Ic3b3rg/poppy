@@ -10,10 +10,12 @@ from fastapi import FastAPI
 from openai_codex import AsyncCodex
 
 from poppy.adapters.codex import CodexAdapter
+from poppy.adapters.codex_onboarding import CodexOnboarding, CodexOnboardingPort
 from poppy.adapters.github import GitHubAdapter
 from poppy.adapters.github_onboarding import GitHubOnboarding
 from poppy.application.review_cycle import ReviewCycle
 from poppy.application.scheduler import InMemoryScheduler
+from poppy.chatgpt_setup import ChatGPTSetup, ChatGPTSetupStore
 from poppy.codex_runtime import build_codex_config, require_chatgpt_account
 from poppy.config import CONTEXT_OVERHEAD_RESERVE, PoppySettings, read_github_private_key
 from poppy.github_setup import GitHubSetupStore
@@ -37,6 +39,7 @@ def create_service(
     *,
     clock: Callable[[], float] = time.time,
     github_onboarding_client: httpx.AsyncClient | None = None,
+    codex_onboarding: CodexOnboardingPort | None = None,
 ) -> FastAPI:
     credentials = settings.reviewer_credentials()
     if credentials is None:
@@ -50,6 +53,9 @@ def create_service(
             )
             github_setup = GitHubSetupStore(data_dir=data_dir)
             github_setup.initialize()
+            chatgpt_store = ChatGPTSetupStore(data_dir=data_dir)
+            chatgpt_store.initialize()
+            codex_home = _prepare_private_directory(settings.codex_home.expanduser().resolve())
             bootstrap_token = setup_session.initialize()
         except (OSError, SetupStateError) as error:
             raise RuntimeConfigurationError("Poppy setup state is not usable") from error
@@ -66,12 +72,25 @@ def create_service(
             timeout=httpx.Timeout(30, connect=10),
         )
         github_onboarding = GitHubOnboarding(client=setup_github_client, clock=clock)
+        setup_codex_client = (
+            AsyncCodex(build_codex_config(codex_home)) if codex_onboarding is None else None
+        )
+        setup_codex = (
+            CodexOnboarding(client=setup_codex_client)
+            if setup_codex_client is not None
+            else codex_onboarding
+        )
+        assert setup_codex is not None
+        chatgpt_setup = ChatGPTSetup(store=chatgpt_store, codex=setup_codex)
 
         @asynccontextmanager
         async def setup_lifespan(_app: FastAPI) -> AsyncIterator[None]:
             try:
                 yield
             finally:
+                await chatgpt_setup.close()
+                if setup_codex_client is not None:
+                    await setup_codex_client.close()
                 if github_onboarding_client is None:
                     await setup_github_client.aclose()
 
@@ -79,6 +98,7 @@ def create_service(
             setup_session=setup_session,
             github_setup=github_setup,
             github_onboarding=github_onboarding,
+            chatgpt_setup=chatgpt_setup,
             public_base_url=settings.public_base_url,
             lifespan=setup_lifespan,
         )
