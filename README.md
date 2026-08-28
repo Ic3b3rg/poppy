@@ -96,7 +96,7 @@ to that App before marking GitHub connected. A rejected or unavailable verificat
 installation step retryable. Accepted credentials and installation identity are written atomically
 to `github-setup.json` with restrictive permissions, so the connected state survives restart.
 Connecting GitHub alone does not finish onboarding: ChatGPT connection and final readiness are
-separate setup steps.
+separate setup conditions.
 
 The protocol behavior follows GitHub's current documentation:
 
@@ -133,14 +133,38 @@ survives container replacement; an interrupted pending attempt resumes as failed
 and the mere presence of a partial `auth.json` is never treated as connected.
 
 GitHub and ChatGPT remain independent setup steps: either can be connected first. Completing this
-step does not by itself activate reviewer mode or close the Setup Session; final readiness is a
-separate onboarding slice.
+step activates reviewer mode only when the GitHub installation is also connected and valid.
 
 The authentication behavior follows OpenAI's current documentation:
 
 - [Codex App Server authentication endpoints](https://learn.chatgpt.com/docs/app-server#auth-endpoints)
 - [Login on headless devices](https://learn.chatgpt.com/docs/auth#login-on-headless-devices)
 - [Codex credential storage](https://learn.chatgpt.com/docs/auth#credential-storage)
+
+### Enter reviewer mode
+
+When both connections are valid, Poppy constructs the existing GitHub adapter, Codex adapter,
+Review Cycle, and in-memory scheduler inside the running process. It then atomically persists a
+non-secret readiness marker, removes the server-side Setup Session state, and begins accepting
+signed pull-request webhooks. No restart or additional confirmation is required.
+
+Readiness permanently removes the setup surface. Every `/setup` page, mutation, and provider
+callback returns `404 Not Found`, including requests carrying an old bootstrap link or Setup
+Session cookie. `GET /healthz` reports `mode: reviewer` only while an active reviewer is available;
+an instance sealed as ready but unable to construct that runtime reports `mode: unavailable` and
+continues rejecting webhooks.
+
+On restart, the readiness marker is consulted before any Setup Session is created. A ready
+instance emits no setup link, reloads the connected GitHub credentials and Codex home, validates
+the ChatGPT account, and starts directly in reviewer mode. Missing, corrupt, or invalid ready-state
+credentials never reopen setup. GitHub webhook bodies are authenticated with the persisted secret
+and `X-Hub-Signature-256` before the unchanged Review Cycle is scheduled.
+
+The lifecycle and signature handling follow the current official guidance:
+
+- [FastAPI lifespan events](https://fastapi.tiangolo.com/advanced/events/)
+- [Starlette lifespan](https://www.starlette.io/lifespan/)
+- [Validating GitHub webhook deliveries](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries)
 
 ## Start, stop, and update
 
@@ -151,9 +175,10 @@ docker compose stop
 docker compose start
 ```
 
-The protected Setup Session and any partial setup state remain in `poppy_codex` across these
-operations. A link is logged for a fresh volume, and a distinct recovery link is logged after a
-restart only when the cookie handoff was not yet confirmed.
+Before readiness, the protected Setup Session and any partial setup state remain in `poppy_codex`
+across these operations. A link is logged for a fresh volume, and a distinct recovery link is
+logged after a restart only when the cookie handoff was not yet confirmed. After readiness, Poppy
+starts directly in reviewer mode and never creates or logs another Setup Session.
 
 An existing pre-onboarding reviewer keeps its `.env`, `secrets/github-app.pem`, and
 `poppy_codex` volume. Before its first `docker compose up` on this version, add this Compose-only
