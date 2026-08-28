@@ -72,11 +72,11 @@ class CodexOnboarding:
                 verification_url=handle.verification_url,
                 user_code=handle.user_code,
             )
-        except Exception as error:
+        except Exception:
             if handle is not None:
                 with suppress(Exception):
                     await handle.cancel()
-            raise CodexOnboardingError("ChatGPT authorization could not be started") from error
+            raise CodexOnboardingError("ChatGPT authorization could not be started") from None
         self._attempts[authorization.login_id] = handle
         return authorization
 
@@ -89,22 +89,22 @@ class CodexOnboarding:
             await self.verify_chatgpt_account()
         except CodexOnboardingError:
             raise
-        except Exception as error:
-            raise CodexOnboardingError("ChatGPT authorization failed") from error
+        except Exception:
+            raise CodexOnboardingError("ChatGPT authorization failed") from None
         finally:
             self._attempts.pop(login_id, None)
 
     async def verify_chatgpt_account(self) -> None:
         try:
             await require_chatgpt_account(self._client)
-        except CodexAuthenticationError as error:
+        except CodexAuthenticationError:
             with suppress(Exception):
                 await self._client.logout()
             raise CodexUnsupportedAccountError(
                 "ChatGPT authorization returned an unsupported account"
-            ) from error
-        except Exception as error:
-            raise CodexOnboardingError("ChatGPT account could not be verified") from error
+            ) from None
+        except Exception:
+            raise CodexOnboardingError("ChatGPT account could not be verified") from None
 
     async def cancel(self, login_id: str) -> None:
         handle = self._attempt(login_id)
@@ -114,16 +114,16 @@ class CodexOnboarding:
                 raise CodexOnboardingError("ChatGPT authorization could not be cancelled")
         except CodexOnboardingError:
             raise
-        except Exception as error:
-            raise CodexOnboardingError("ChatGPT authorization could not be cancelled") from error
+        except Exception:
+            raise CodexOnboardingError("ChatGPT authorization could not be cancelled") from None
         finally:
             self._attempts.pop(login_id, None)
 
     def _attempt(self, login_id: str) -> AsyncDeviceCodeLoginHandle:
         try:
             return self._attempts[login_id]
-        except KeyError as error:
-            raise CodexOnboardingError("ChatGPT authorization is no longer active") from error
+        except KeyError:
+            raise CodexOnboardingError("ChatGPT authorization is no longer active") from None
 
 
 def _contains_control_character(value: str) -> bool:

@@ -5,15 +5,19 @@ import re
 import stat
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import cast
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import FastAPI
+from openai_codex import AsyncCodex
 
 from poppy.adapters.codex_onboarding import (
     CodexDeviceAuthorization,
+    CodexOnboarding,
     CodexOnboardingError,
     CodexUnsupportedAccountError,
 )
@@ -232,6 +236,38 @@ async def test_failed_authorization_is_not_connected_and_can_be_retried_safely(
     assert "Pending" in pending_page.text
     assert codex.start_count == 2
     assert "Connected" in connected_page.text
+
+
+@pytest.mark.asyncio
+async def test_sdk_details_are_not_logged_when_failure_state_cannot_be_persisted(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    provider_detail = "refresh-token-secret-must-not-log"
+    configured = setup_settings(tmp_path)
+
+    async def fail_after_state_becomes_unwritable() -> None:
+        (configured.data_dir / "chatgpt-setup.json").mkdir()
+        raise RuntimeError(provider_detail)
+
+    sdk = MagicMock(spec=AsyncCodex)
+    sdk.login_chatgpt_device_code = AsyncMock(side_effect=fail_after_state_becomes_unwritable)
+    codex = CodexOnboarding(client=cast(AsyncCodex, sdk))
+    caplog.set_level(logging.WARNING)
+    app = create_service(configured, codex_onboarding=codex)
+
+    async with app.router.lifespan_context(app), setup_client(app) as client:
+        csrf_token = await establish_setup_session(client, caplog)
+        failed = await client.post(
+            "/setup/chatgpt/connect",
+            data={"csrf_token": csrf_token},
+            headers={"origin": "https://poppy.example"},
+        )
+
+    assert failed.status_code == 503
+    assert failed.json() == {"error": "setup unavailable"}
+    assert provider_detail not in failed.text
+    assert provider_detail not in caplog.text
 
 
 @pytest.mark.asyncio
