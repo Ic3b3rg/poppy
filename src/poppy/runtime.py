@@ -213,7 +213,9 @@ class InstanceRuntime:
             await active.close()
 
     async def _build_reviewer(self, connection: ReviewerConnection) -> ActiveReviewer:
+        scheduler: InMemoryScheduler | None = None
         try:
+            webhook_secret = connection.webhook_secret.encode()
             adapters = await self._adapter_factory.create(connection)
             cycle = ReviewCycle(
                 github=adapters.github,
@@ -224,13 +226,15 @@ class InstanceRuntime:
                 handler=cycle.run,
                 concurrency=self._concurrency,
             )
+            return ActiveReviewer(
+                webhook_secret=webhook_secret,
+                scheduler=scheduler,
+                close_scheduler=scheduler.close,
+            )
         except Exception:
+            if scheduler is not None:
+                await scheduler.close()
             raise RuntimeStateError("Poppy reviewer runtime could not be initialized") from None
-        return ActiveReviewer(
-            webhook_secret=connection.webhook_secret.encode(),
-            scheduler=scheduler,
-            close_scheduler=scheduler.close,
-        )
 
     async def _activate_reviewer(
         self,
