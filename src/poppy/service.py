@@ -1,6 +1,7 @@
 import logging
 import stat
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -14,7 +15,8 @@ from poppy.application.review_cycle import ReviewCycle
 from poppy.application.scheduler import InMemoryScheduler
 from poppy.codex_runtime import build_codex_config, require_chatgpt_account
 from poppy.config import CONTEXT_OVERHEAD_RESERVE, PoppySettings, read_github_private_key
-from poppy.http import create_app
+from poppy.http import create_app, create_setup_app
+from poppy.setup_session import SetupSessionStore, SetupStateError
 
 logger = logging.getLogger(__name__)
 
@@ -23,16 +25,45 @@ class RuntimeConfigurationError(RuntimeError):
     """The local runtime cannot enforce Poppy's isolation settings."""
 
 
-def create_service(settings: PoppySettings) -> FastAPI:
+def create_service(
+    settings: PoppySettings,
+    *,
+    clock: Callable[[], float] = time.time,
+) -> FastAPI:
+    credentials = settings.reviewer_credentials()
+    if credentials is None:
+        try:
+            data_dir = _prepare_private_directory(settings.data_dir.expanduser().resolve())
+            setup_session = SetupSessionStore(
+                data_dir=data_dir,
+                bootstrap_ttl_seconds=settings.setup_bootstrap_ttl_seconds,
+                session_ttl_seconds=settings.setup_session_ttl_seconds,
+                clock=clock,
+            )
+            bootstrap_token = setup_session.initialize()
+        except SetupStateError as error:
+            raise RuntimeConfigurationError("Poppy setup state is not usable") from error
+        if bootstrap_token is not None:
+            setup_url = f"{str(settings.public_base_url).rstrip('/')}/setup?token={bootstrap_token}"
+            logger.info(
+                "Poppy Setup Session: %s",
+                setup_url,
+                extra={"event": "setup_bootstrap_created", "setup_url": setup_url},
+            )
+        return create_setup_app(
+            setup_session=setup_session,
+            public_base_url=str(settings.public_base_url),
+        )
+
     codex_home, workspace = _prepare_directories(
         codex_home=settings.codex_home,
         workspace=settings.codex_workspace,
     )
-    private_key = read_github_private_key(settings.github_private_key_file)
+    private_key = read_github_private_key(credentials.private_key_file)
     github_client = httpx.AsyncClient(timeout=httpx.Timeout(30, connect=10))
     codex_client = AsyncCodex(build_codex_config(codex_home))
     github = GitHubAdapter(
-        app_id=str(settings.github_app_id),
+        app_id=str(credentials.app_id),
         private_key=private_key,
         client=github_client,
         max_patch_characters=(settings.context_limit_characters - CONTEXT_OVERHEAD_RESERVE),
@@ -68,7 +99,7 @@ def create_service(settings: PoppySettings) -> FastAPI:
             await github_client.aclose()
 
     return create_app(
-        webhook_secret=settings.github_webhook_secret.get_secret_value().encode(),
+        webhook_secret=credentials.webhook_secret.get_secret_value().encode(),
         scheduler=scheduler,
         lifespan=lifespan,
     )
@@ -94,10 +125,11 @@ def _prepare_directories(*, codex_home: Path, workspace: Path) -> tuple[Path, Pa
     return resolved_home, resolved_workspace
 
 
-def _prepare_private_directory(path: Path) -> None:
+def _prepare_private_directory(path: Path) -> Path:
     if path.exists() and not path.is_dir():
         raise RuntimeConfigurationError("Poppy runtime path is not a directory")
     if not path.exists():
         path.mkdir(parents=True, mode=0o700)
     if stat.S_IMODE(path.stat().st_mode) != 0o700:
         path.chmod(0o700)
+    return path

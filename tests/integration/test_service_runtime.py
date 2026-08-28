@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
+from httpx import AsyncClient as ASGIClient
 from pydantic import SecretStr
 
 import poppy.service as service_module
@@ -32,7 +33,11 @@ async def test_service_starts_authenticated_codex_and_closes_resources(
 
     async with app.router.lifespan_context(app):
         require_account.assert_awaited_once_with(codex_client)
+        transport = httpx.ASGITransport(app=app)
+        async with ASGIClient(transport=transport, base_url="http://test") as client:
+            health = await client.get("/healthz")
 
+    assert health.json() == {"status": "ok", "mode": "reviewer"}
     codex_client.close.assert_awaited_once()
     github_client.aclose.assert_awaited_once()
 

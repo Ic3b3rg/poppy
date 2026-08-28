@@ -48,3 +48,32 @@ def test_context_limit_cannot_remove_reserved_prompt_space(
 def test_private_key_must_be_a_readable_file(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="private key"):
         read_github_private_key(tmp_path / "missing.pem")
+
+
+@pytest.mark.parametrize(
+    "public_base_url",
+    [
+        "http://poppy.example",
+        "https://poppy.example/nested",
+        "https://poppy.example/?query=value",
+        "https://poppy.example/#fragment",
+    ],
+)
+def test_public_base_url_is_a_complete_https_origin(public_base_url: str) -> None:
+    with pytest.raises(ValidationError):
+        PoppySettings(public_base_url=public_base_url, _env_file=None)
+
+
+def test_empty_portable_url_falls_back_when_coolify_magic_is_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("POPPY_PUBLIC_BASE_URL", "")
+
+    settings = PoppySettings(_env_file=None)
+
+    assert str(settings.public_base_url) == "https://localhost/"
+
+
+def test_partial_legacy_reviewer_credentials_are_rejected() -> None:
+    with pytest.raises(ValidationError, match="configured together"):
+        PoppySettings(github_app_id=123, _env_file=None)

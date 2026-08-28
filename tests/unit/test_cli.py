@@ -53,4 +53,5 @@ def test_serve_command_runs_single_service(monkeypatch: pytest.MonkeyPatch) -> N
         port=8_123,
         log_level="warning",
         workers=1,
+        access_log=False,
     )

@@ -25,8 +25,8 @@ WORKDIR /app
 RUN groupadd --gid 10001 poppy \
     && useradd --uid 10001 --gid 10001 --no-create-home \
         --home-dir /nonexistent --shell /usr/sbin/nologin poppy \
-    && mkdir -p /var/lib/poppy/codex /var/empty/poppy \
-    && chmod 700 /var/lib/poppy/codex /var/empty/poppy \
+    && mkdir -p /var/lib/poppy /var/empty/poppy \
+    && chmod 700 /var/lib/poppy /var/empty/poppy \
     && chown -R poppy:poppy /var/lib/poppy /var/empty/poppy
 
 COPY --from=builder --chown=poppy:poppy /app/.venv /app/.venv

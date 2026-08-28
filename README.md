@@ -22,10 +22,8 @@ and its acceptance criteria are in [SPEC.md](SPEC.md).
 
 ## Requirements
 
-- a GitHub account that can create and install a GitHub App;
-- a ChatGPT account with Codex access;
 - a Linux host with current Docker Engine and Docker Compose;
-- an HTTPS URL routed to `127.0.0.1:8000` by your reverse proxy or Cloudflare Tunnel.
+- a stable HTTPS URL routed to Poppy's internal port `8000`.
 
 No workflow file is needed in the repositories being reviewed.
 
@@ -33,58 +31,39 @@ Poppy keeps no repository database. It sends bounded PR metadata and textual pat
 through Codex so the model can perform the review. Poppy itself makes application calls only to
 GitHub and OpenAI.
 
-## 1. Create the GitHub App
+## Start a protected Setup Session
 
-In GitHub, open **Settings → Developer settings → GitHub Apps → New GitHub App** and set:
+Poppy can boot before GitHub or ChatGPT is connected. On an empty private data volume it starts in
+setup mode, generates one secret bootstrap link, and writes that complete link to the deployment
+log. Opening the link exchanges its one-time query token for a Secure, HttpOnly, SameSite Setup
+Session cookie and redirects to `/setup`, removing the token from the visible address.
 
-- Webhook URL: `https://your-domain.example/webhooks/github`;
-- Webhook secret: a new random value that you keep for the `.env` file;
-- Repository permissions:
-  - Checks: **Read and write**;
-  - Pull requests: **Read and write**;
-  - Issues: **Read and write** (GitHub labels use the Issues API);
-  - Metadata: **Read-only**;
-- Subscribe to events: **Pull request**.
-
-Do not grant `Contents: write`. Generate a private key, install the App only on your selected
-repositories, choose **Only on this account** when GitHub asks where it can be installed, and note
-the numeric App ID.
-
-## 2. Configure Poppy
+For a portable Docker Compose deployment, configure the public HTTPS origin:
 
 ```bash
 git clone https://github.com/Ic3b3rg/poppy.git
 cd poppy
 cp .env.example .env
-mkdir -p secrets
-mv ~/Downloads/your-github-app-key.pem secrets/github-app.pem
-chmod 600 .env secrets/github-app.pem
+chmod 600 .env
+# Edit POPPY_PUBLIC_BASE_URL in .env, then:
+docker compose up -d --build
+docker compose logs poppy
 ```
 
-Edit `.env` with the App ID and the same webhook secret configured in GitHub. The key, `.env`,
-Codex login, and all PEM files are ignored by Git and excluded from the image build.
+On Coolify, deploy this repository as a Docker Compose resource and assign the `poppy` service an
+HTTPS domain routed to port `8000`. The Compose definition declares Coolify's
+`SERVICE_URL_POPPY_8000` value and uses it as Poppy's public origin; `POPPY_PUBLIC_BASE_URL`
+remains the explicit override for other hosts.
 
-## 3. Authenticate the ChatGPT subscription once
+The `poppy_data` volume is the sole durable store. Setup state is atomically persisted there with
+restrictive permissions and survives container replacement. The container root filesystem stays
+read-only; only that volume and the bounded `/tmp` tmpfs are writable.
 
-```bash
-docker compose build
-docker compose run --rm poppy login
-```
+A healthy fresh instance answers `GET /healthz` with `{"status":"ok","mode":"setup"}`. Review
+webhooks return `503 Service Unavailable` until onboarding is complete. The GitHub and ChatGPT
+connection actions are delivered by the following onboarding slices.
 
-Open the displayed URL, enter the device code, and finish the ChatGPT login. Authentication is
-stored in the private `poppy_codex` Docker volume and survives container replacement. Poppy
-refuses to start if that volume contains no ChatGPT login or contains only API-key auth.
-
-## 4. Start and stop
-
-```bash
-docker compose up -d
-docker compose ps
-docker compose logs -f poppy
-```
-
-Point the HTTPS proxy or Cloudflare Tunnel at `http://127.0.0.1:8000`. A healthy instance answers
-`GET /healthz` with `{"status":"ok"}`.
+## Start, stop, and update
 
 Turn Poppy off and on whenever you want:
 
@@ -93,8 +72,8 @@ docker compose stop
 docker compose start
 ```
 
-GitHub does not deliver work while the bot is stopped. You can redeliver a missed webhook from
-the GitHub App's **Advanced** page after restarting it.
+The protected Setup Session and any partial setup state remain in `poppy_data` across these
+operations. A bootstrap link is logged only when that volume is fresh.
 
 To update Poppy:
 
