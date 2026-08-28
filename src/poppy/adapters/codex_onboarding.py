@@ -74,8 +74,7 @@ class CodexOnboarding:
             )
         except Exception:
             if handle is not None:
-                with suppress(Exception):
-                    await handle.cancel()
+                await _discard_rejected_attempt(handle)
             raise CodexOnboardingError("ChatGPT authorization could not be started") from None
         self._attempts[authorization.login_id] = handle
         return authorization
@@ -128,3 +127,11 @@ class CodexOnboarding:
 
 def _contains_control_character(value: str) -> bool:
     return any(ord(character) < 32 or ord(character) == 127 for character in value)
+
+
+async def _discard_rejected_attempt(handle: AsyncDeviceCodeLoginHandle) -> None:
+    with suppress(Exception):
+        response = await handle.cancel()
+        if response.status is CancelLoginAccountStatus.canceled:
+            # The SDK unregisters its per-login notification queue only in wait().
+            await handle.wait()
