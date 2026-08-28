@@ -117,6 +117,12 @@ class GitHubSetupStore:
             return GitHubSetupView(status="disconnected")
         return _setup_view(self._read_state())
 
+    def connected_installation(self) -> ConnectedInstallation | None:
+        if not self._state_file.exists():
+            return None
+        state = self._read_state()
+        return state if isinstance(state, ConnectedInstallation) else None
+
     def begin_manifest(
         self,
         *,

@@ -3,6 +3,8 @@ import json
 import logging
 import re
 import secrets
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Protocol
 from urllib.parse import parse_qs
 
@@ -30,6 +32,7 @@ from poppy.github_setup import (
     installation_url,
     manifest_registration_url,
 )
+from poppy.runtime import ActiveReviewer, RuntimeStateError
 from poppy.setup_session import SetupSessionStore, SetupStateError
 from poppy.webhook import InvalidWebhook, normalize_pull_request_webhook, verify_signature
 
@@ -94,6 +97,18 @@ class SchedulerPort(Protocol):
     async def schedule(self, request: ReviewRequest) -> bool: ...
 
 
+class ReviewerRuntimePort(Protocol):
+    @property
+    def mode(self) -> str: ...
+
+    @property
+    def setup_closed(self) -> bool: ...
+
+    def active_reviewer(self) -> ActiveReviewer | None: ...
+
+    async def promote_if_ready(self) -> bool: ...
+
+
 def create_setup_app(
     *,
     setup_session: SetupSessionStore,
@@ -101,9 +116,12 @@ def create_setup_app(
     github_onboarding: GitHubOnboarding,
     chatgpt_setup: ChatGPTSetup,
     public_base_url: HttpUrl,
+    reviewer_runtime: ReviewerRuntimePort | None = None,
     lifespan: Lifespan[FastAPI] | None = None,
 ) -> FastAPI:
-    app = _create_base_app(mode="setup", lifespan=lifespan)
+    runtime: ReviewerRuntimePort = reviewer_runtime or _UnavailableReviewerRuntime()
+    app = _create_base_app(mode=lambda: runtime.mode, lifespan=lifespan)
+    _register_github_webhook(app, runtime)
     expected_origin = str(public_base_url).rstrip("/")
 
     @app.middleware("http")
@@ -113,6 +131,10 @@ def create_setup_app(
     ) -> Response:
         try:
             is_setup_route = request.url.path == "/setup" or request.url.path.startswith("/setup/")
+            if is_setup_route and runtime.setup_closed:
+                return _protect_setup_response(
+                    JSONResponse({"error": "not found"}, status_code=404)
+                )
             if is_setup_route and request.method not in {"GET", "HEAD", "OPTIONS"}:
                 session_token = request.cookies.get(SETUP_SESSION_COOKIE)
                 if request.headers.get("origin") != expected_origin or session_token is None:
@@ -192,10 +214,6 @@ def create_setup_app(
             samesite="strict",
         )
         return _protect_setup_response(response)
-
-    @app.post("/webhooks/github")
-    async def unavailable_github_webhook() -> JSONResponse:
-        return JSONResponse({"error": "reviewer unavailable"}, status_code=503)
 
     @app.post("/setup/github/connect")
     async def connect_github(request: Request) -> Response:
@@ -335,6 +353,14 @@ def create_setup_app(
                 {"error": "GitHub App installation validation became stale"},
                 status_code=409,
             )
+        try:
+            await runtime.promote_if_ready()
+        except RuntimeStateError:
+            logger.warning(
+                "Poppy reviewer promotion failed",
+                extra={"event": "reviewer_promotion_failed"},
+            )
+            return JSONResponse({"error": "reviewer unavailable"}, status_code=503)
         return RedirectResponse("/setup", status_code=303)
 
     return app
@@ -489,10 +515,22 @@ def create_app(
     scheduler: SchedulerPort,
     lifespan: Lifespan[FastAPI] | None = None,
 ) -> FastAPI:
-    app = _create_base_app(mode="reviewer", lifespan=lifespan)
+    runtime = _StaticReviewerRuntime(
+        active=ActiveReviewer(webhook_secret=webhook_secret, scheduler=scheduler)
+    )
+    app = _create_base_app(mode=lambda: runtime.mode, lifespan=lifespan)
+    _register_github_webhook(app, runtime)
+    return app
+
+
+def _register_github_webhook(app: FastAPI, runtime: ReviewerRuntimePort) -> None:
 
     @app.post("/webhooks/github")
     async def github_webhook(request: Request) -> JSONResponse:
+        active = runtime.active_reviewer()
+        if active is None:
+            return JSONResponse({"error": "reviewer unavailable"}, status_code=503)
+
         content_type = request.headers.get("content-type", "").partition(";")[0]
         if content_type != "application/json":
             return JSONResponse({"error": "unsupported content type"}, status_code=415)
@@ -503,7 +541,7 @@ def create_app(
         if not verify_signature(
             body,
             request.headers.get("x-hub-signature-256"),
-            webhook_secret,
+            active.webhook_secret,
         ):
             return JSONResponse({"error": "invalid signature"}, status_code=401)
         if request.headers.get("x-github-event") != "pull_request":
@@ -519,21 +557,47 @@ def create_app(
 
         if review_request is None:
             return JSONResponse({"status": "ignored"}, status_code=202)
-        scheduled = await scheduler.schedule(review_request)
+        scheduled = await active.scheduler.schedule(review_request)
         status = "scheduled" if scheduled else "duplicate"
         return JSONResponse({"status": status}, status_code=202)
 
-    return app
 
-
-def _create_base_app(*, mode: str, lifespan: Lifespan[FastAPI] | None) -> FastAPI:
+def _create_base_app(
+    *,
+    mode: Callable[[], str],
+    lifespan: Lifespan[FastAPI] | None,
+) -> FastAPI:
     app = FastAPI(title="Poppy", docs_url=None, redoc_url=None, lifespan=lifespan)
 
     @app.get("/healthz")
     async def health() -> dict[str, str]:
-        return {"status": "ok", "mode": mode}
+        return {"status": "ok", "mode": mode()}
 
     return app
+
+
+class _UnavailableReviewerRuntime:
+    mode = "setup"
+    setup_closed = False
+
+    def active_reviewer(self) -> None:
+        return None
+
+    async def promote_if_ready(self) -> bool:
+        return False
+
+
+@dataclass(frozen=True, slots=True)
+class _StaticReviewerRuntime:
+    active: ActiveReviewer
+    mode: str = "reviewer"
+    setup_closed: bool = True
+
+    def active_reviewer(self) -> ActiveReviewer:
+        return self.active
+
+    async def promote_if_ready(self) -> bool:
+        return True
 
 
 async def _read_bounded_body(request: Request, *, max_bytes: int) -> bytes | None:

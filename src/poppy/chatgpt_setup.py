@@ -1,6 +1,7 @@
 import asyncio
 import json
 import secrets
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -128,9 +129,16 @@ class ChatGPTSetupStore:
 
 
 class ChatGPTSetup:
-    def __init__(self, *, store: ChatGPTSetupStore, codex: CodexOnboardingPort) -> None:
+    def __init__(
+        self,
+        *,
+        store: ChatGPTSetupStore,
+        codex: CodexOnboardingPort,
+        on_connected: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         self._store = store
         self._codex = codex
+        self._on_connected = on_connected
         self._completion_task: asyncio.Task[None] | None = None
         self._connect_lock = asyncio.Lock()
         self._cancellation: _CancellationInProgress | None = None
@@ -217,7 +225,9 @@ class ChatGPTSetup:
                 return
             self._store.fail(login_id)
             return
-        self._store.connect(login_id)
+        connected = self._store.connect(login_id)
+        if connected and self._on_connected is not None:
+            await self._on_connected()
 
 
 def _matches_pending_login(state: ChatGPTSetupView, login_id: str) -> bool:

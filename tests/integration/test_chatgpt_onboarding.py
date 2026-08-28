@@ -24,6 +24,7 @@ from poppy.adapters.codex_onboarding import (
 from poppy.adapters.github_onboarding import GitHubAppCredentials, GitHubInstallation
 from poppy.config import PoppySettings
 from poppy.github_setup import GitHubSetupStore
+from poppy.runtime import ReviewerAdapters, ReviewerConnection
 from poppy.service import RuntimeConfigurationError, create_service
 
 
@@ -176,8 +177,13 @@ async def test_chatgpt_can_connect_after_github_is_already_connected(
     configured = setup_settings(tmp_path)
     seed_connected_github(configured.data_dir)
     codex = FakeCodexOnboarding()
+    reviewer = FakeReviewerAdapterFactory()
     caplog.set_level(logging.WARNING, logger="poppy.service")
-    app = create_service(configured, codex_onboarding=codex)
+    app = create_service(
+        configured,
+        codex_onboarding=codex,
+        reviewer_adapter_factory=reviewer,
+    )
 
     async with app.router.lifespan_context(app), setup_client(app) as client:
         csrf_token = await establish_setup_session(client, caplog)
@@ -188,12 +194,14 @@ async def test_chatgpt_can_connect_after_github_is_already_connected(
             headers={"origin": "https://poppy.example"},
         )
         codex.complete()
-        both_connected_page = await wait_for_page_text(client, "Success. Connected")
+        reviewer_health = await wait_for_reviewer_mode(client)
+        closed_setup = await client.get("/setup")
 
     assert re.search(r"<dt>GitHub</dt>\s*<dd>Connected</dd>", github_first_page.text)
     assert "Connect ChatGPT" in github_first_page.text
-    assert re.search(r"<dt>GitHub</dt>\s*<dd>Connected</dd>", both_connected_page.text)
-    assert "Success. Connected" in both_connected_page.text
+    assert reviewer_health.json() == {"status": "ok", "mode": "reviewer"}
+    assert closed_setup.status_code == 404
+    assert len(reviewer.connections) == 1
 
 
 @pytest.mark.asyncio
@@ -655,6 +663,15 @@ class FakeCodexOnboarding:
         self.completions[login_id].set()
 
 
+@dataclass
+class FakeReviewerAdapterFactory:
+    connections: list[ReviewerConnection] = field(default_factory=list)
+
+    async def create(self, connection: ReviewerConnection) -> ReviewerAdapters:
+        self.connections.append(connection)
+        return ReviewerAdapters(github=MagicMock(), codex=MagicMock())
+
+
 def setup_settings(tmp_path: Path) -> PoppySettings:
     return PoppySettings(
         public_base_url="https://poppy.example",
@@ -732,3 +749,12 @@ async def wait_for_page_text(client: httpx.AsyncClient, expected: str) -> httpx.
             return page
         await asyncio.sleep(0)
     raise AssertionError(f"setup page did not contain {expected!r}")
+
+
+async def wait_for_reviewer_mode(client: httpx.AsyncClient) -> httpx.Response:
+    for _ in range(20):
+        health = await client.get("/healthz")
+        if health.json().get("mode") == "reviewer":
+            return health
+        await asyncio.sleep(0)
+    raise AssertionError("Poppy did not enter reviewer mode")

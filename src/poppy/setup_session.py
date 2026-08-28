@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import os
 import re
 import secrets
 import time
@@ -120,6 +121,18 @@ class SetupSessionStore:
         ):
             return False
         return secrets.compare_digest(_csrf_token(session_token), csrf_token)
+
+    def close(self) -> None:
+        try:
+            self._state_file.unlink(missing_ok=True)
+            directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            directory_descriptor = os.open(self._state_file.parent, directory_flags)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        except OSError as error:
+            raise SetupStateError("Setup Session state cannot be removed") from error
 
     def _read_state(self) -> SetupState:
         try:
