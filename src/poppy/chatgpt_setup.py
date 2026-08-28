@@ -106,6 +106,8 @@ class ChatGPTSetup:
         self._codex = codex
         self._completion_task: asyncio.Task[None] | None = None
         self._connect_lock = asyncio.Lock()
+        self._cancelling_login_id: str | None = None
+        self._completion_failures_during_cancel: set[str] = set()
 
     def view(self) -> ChatGPTSetupView:
         return self._store.view()
@@ -144,11 +146,22 @@ class ChatGPTSetup:
             authorization = state.authorization
             if state.status != "pending" or authorization is None:
                 return False
-            await self._codex.cancel(authorization.login_id)
-            cancelled = self._store.cancel(authorization.login_id)
-            if cancelled:
-                await self._stop_completion_task()
-            return cancelled
+            login_id = authorization.login_id
+            self._cancelling_login_id = login_id
+            try:
+                try:
+                    await self._codex.cancel(login_id)
+                except CodexOnboardingError:
+                    if login_id in self._completion_failures_during_cancel:
+                        self._store.fail(login_id)
+                    raise
+                cancelled = self._store.cancel(login_id)
+                if cancelled:
+                    await self._stop_completion_task()
+                return cancelled
+            finally:
+                self._cancelling_login_id = None
+                self._completion_failures_during_cancel.discard(login_id)
 
     async def _stop_completion_task(self) -> None:
         task = self._completion_task
@@ -163,6 +176,9 @@ class ChatGPTSetup:
         try:
             await self._codex.wait_for_completion(login_id)
         except CodexOnboardingError:
+            if self._cancelling_login_id == login_id:
+                self._completion_failures_during_cancel.add(login_id)
+                return
             self._store.fail(login_id)
             return
         self._store.connect(login_id)

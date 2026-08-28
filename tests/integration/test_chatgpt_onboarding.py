@@ -396,6 +396,42 @@ async def test_success_winning_a_cancel_race_cannot_be_overwritten(
 
 
 @pytest.mark.asyncio
+async def test_cancel_completion_notification_finishes_as_cancelled(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    cancel_release = asyncio.Event()
+    codex = FakeCodexOnboarding(cancel_release=cancel_release)
+    caplog.set_level(logging.WARNING, logger="poppy.service")
+    app = create_service(setup_settings(tmp_path), codex_onboarding=codex)
+
+    async with app.router.lifespan_context(app), setup_client(app) as client:
+        csrf_token = await establish_setup_session(client, caplog)
+        await client.post(
+            "/setup/chatgpt/connect",
+            data={"csrf_token": csrf_token},
+            headers={"origin": "https://poppy.example"},
+        )
+        cancel_request = asyncio.create_task(
+            client.post(
+                "/setup/chatgpt/cancel",
+                data={"csrf_token": csrf_token},
+                headers={"origin": "https://poppy.example"},
+            )
+        )
+        await codex.cancel_started.wait()
+        codex.complete(CodexOnboardingError("cancel completion provider detail"))
+        await asyncio.sleep(0)
+        cancel_release.set()
+        cancelled = await cancel_request
+        final_page = await client.get("/setup")
+
+    assert cancelled.status_code == 303
+    assert "Cancelled" in final_page.text
+    assert "Failed" not in final_page.text
+
+
+@pytest.mark.asyncio
 async def test_activation_data_is_html_escaped(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
