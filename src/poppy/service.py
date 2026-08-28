@@ -10,7 +10,11 @@ from fastapi import FastAPI
 from openai_codex import AsyncCodex
 
 from poppy.adapters.codex import CodexAdapter
-from poppy.adapters.codex_onboarding import CodexOnboarding, CodexOnboardingPort
+from poppy.adapters.codex_onboarding import (
+    CodexOnboarding,
+    CodexOnboardingError,
+    CodexOnboardingPort,
+)
 from poppy.adapters.github import GitHubAdapter
 from poppy.adapters.github_onboarding import GitHubOnboarding
 from poppy.application.review_cycle import ReviewCycle
@@ -86,6 +90,13 @@ def create_service(
         @asynccontextmanager
         async def setup_lifespan(_app: FastAPI) -> AsyncIterator[None]:
             try:
+                try:
+                    await chatgpt_setup.verify_persisted_connection()
+                except CodexOnboardingError:
+                    logger.warning(
+                        "Persisted ChatGPT authorization could not be verified",
+                        extra={"event": "chatgpt_persisted_authorization_failed"},
+                    )
                 yield
             finally:
                 await chatgpt_setup.close()

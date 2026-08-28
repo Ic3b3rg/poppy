@@ -55,6 +55,8 @@ class CodexOnboardingPort(Protocol):
 
     async def cancel(self, login_id: str) -> None: ...
 
+    async def verify_chatgpt_account(self) -> None: ...
+
 
 class CodexOnboarding:
     def __init__(self, *, client: AsyncCodex) -> None:
@@ -84,20 +86,25 @@ class CodexOnboarding:
             completed = await handle.wait()
             if not completed.success:
                 raise CodexOnboardingError("ChatGPT authorization failed")
-            try:
-                await require_chatgpt_account(self._client)
-            except CodexAuthenticationError as error:
-                with suppress(Exception):
-                    await self._client.logout()
-                raise CodexUnsupportedAccountError(
-                    "ChatGPT authorization returned an unsupported account"
-                ) from error
+            await self.verify_chatgpt_account()
         except CodexOnboardingError:
             raise
         except Exception as error:
             raise CodexOnboardingError("ChatGPT authorization failed") from error
         finally:
             self._attempts.pop(login_id, None)
+
+    async def verify_chatgpt_account(self) -> None:
+        try:
+            await require_chatgpt_account(self._client)
+        except CodexAuthenticationError as error:
+            with suppress(Exception):
+                await self._client.logout()
+            raise CodexUnsupportedAccountError(
+                "ChatGPT authorization returned an unsupported account"
+            ) from error
+        except Exception as error:
+            raise CodexOnboardingError("ChatGPT account could not be verified") from error
 
     async def cancel(self, login_id: str) -> None:
         handle = self._attempt(login_id)

@@ -95,7 +95,8 @@ async def test_success_is_connected_without_github_and_survives_restart(
     assert stat.S_IMODE(state_file.stat().st_mode) == 0o600
     assert credential not in state_file.read_text(encoding="utf-8")
 
-    restarted = create_service(configured, codex_onboarding=FakeCodexOnboarding())
+    restarted_codex = FakeCodexOnboarding()
+    restarted = create_service(configured, codex_onboarding=restarted_codex)
     async with restarted.router.lifespan_context(restarted), setup_client(restarted) as client:
         assert session_cookie is not None
         client.cookies.set(
@@ -108,6 +109,59 @@ async def test_success_is_connected_without_github_and_survives_restart(
 
     assert "ChatGPT" in restarted_page.text
     assert "Connected" in restarted_page.text
+    assert restarted_codex.account_check_count == 1
+
+
+@pytest.mark.asyncio
+async def test_persisted_connected_marker_is_failed_when_codex_rejects_the_account(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    configured = setup_settings(tmp_path)
+    first_codex = FakeCodexOnboarding()
+    caplog.set_level(logging.WARNING)
+    first_app = create_service(configured, codex_onboarding=first_codex)
+
+    async with first_app.router.lifespan_context(first_app), setup_client(first_app) as client:
+        csrf_token = await establish_setup_session(client, caplog)
+        await client.post(
+            "/setup/chatgpt/connect",
+            data={"csrf_token": csrf_token},
+            headers={"origin": "https://poppy.example"},
+        )
+        first_codex.complete()
+        await wait_for_page_text(client, "Connected")
+        session_cookie = client.cookies.get("poppy_setup_session")
+
+    provider_detail = "persisted account provider detail"
+    restarted_codex = FakeCodexOnboarding(
+        account_failures=[CodexUnsupportedAccountError(provider_detail)]
+    )
+    restarted = create_service(configured, codex_onboarding=restarted_codex)
+    async with restarted.router.lifespan_context(restarted), setup_client(restarted) as client:
+        assert session_cookie is not None
+        client.cookies.set(
+            "poppy_setup_session",
+            session_cookie,
+            domain="poppy.example",
+            path="/setup",
+        )
+        failed_page = await client.get("/setup")
+        retried = await client.post(
+            "/setup/chatgpt/connect",
+            data={"csrf_token": csrf_token},
+            headers={"origin": "https://poppy.example"},
+        )
+        pending_page = await client.get("/setup")
+
+    assert restarted_codex.account_check_count == 1
+    assert "Failed" in failed_page.text
+    assert "Connected" not in failed_page.text
+    assert "Retry ChatGPT" in failed_page.text
+    assert provider_detail not in failed_page.text
+    assert provider_detail not in caplog.text
+    assert retried.status_code == 303
+    assert "Pending" in pending_page.text
 
 
 @pytest.mark.asyncio
@@ -514,6 +568,8 @@ class FakeCodexOnboarding:
     credential_file: Path | None = None
     credential: str = ""
     start_failures: list[CodexOnboardingError] = field(default_factory=list)
+    account_failures: list[CodexOnboardingError] = field(default_factory=list)
+    account_check_count: int = 0
     completions: dict[str, asyncio.Event] = field(default_factory=dict)
     completion_failures: dict[str, CodexOnboardingError] = field(default_factory=dict)
     cancelled_login_ids: list[str] = field(default_factory=list)
@@ -542,6 +598,11 @@ class FakeCodexOnboarding:
             raise failure
         if self.credential_file is not None:
             self.credential_file.write_text(self.credential, encoding="utf-8")
+
+    async def verify_chatgpt_account(self) -> None:
+        self.account_check_count += 1
+        if self.account_failures:
+            raise self.account_failures.pop(0)
 
     async def cancel(self, login_id: str) -> None:
         self.cancelled_login_ids.append(login_id)

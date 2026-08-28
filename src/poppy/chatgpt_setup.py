@@ -82,6 +82,12 @@ class ChatGPTSetupStore:
         if self.view().status not in {"pending", "connected"}:
             self._write_state(ChatGPTSetupView(status="failed"))
 
+    def fail_connected(self) -> bool:
+        if self.view().status != "connected":
+            return False
+        self._write_state(ChatGPTSetupView(status="failed"))
+        return True
+
     def _read_state(self) -> ChatGPTSetupView:
         try:
             payload: Any = read_private_json(self._state_file)
@@ -111,6 +117,15 @@ class ChatGPTSetup:
 
     def view(self) -> ChatGPTSetupView:
         return self._store.view()
+
+    async def verify_persisted_connection(self) -> None:
+        if self._store.view().status != "connected":
+            return
+        try:
+            await self._codex.verify_chatgpt_account()
+        except CodexOnboardingError:
+            self._store.fail_connected()
+            raise
 
     async def connect(self) -> bool:
         async with self._connect_lock:
