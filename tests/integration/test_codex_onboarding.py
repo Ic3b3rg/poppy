@@ -131,6 +131,7 @@ async def test_invalid_sdk_activation_data_is_rejected_without_echoing_it(
         login_id="login-1",
         verification_url=verification_url,
         user_code=user_code,
+        cancel=AsyncMock(),
     )
     client = MagicMock(spec=AsyncCodex)
     client.login_chatgpt_device_code = AsyncMock(return_value=handle)
@@ -141,6 +142,7 @@ async def test_invalid_sdk_activation_data_is_rejected_without_echoing_it(
 
     assert verification_url not in str(raised.value)
     assert user_code not in str(raised.value)
+    handle.cancel.assert_awaited_once_with()
 
 
 def chatgpt_account() -> GetAccountResponse:

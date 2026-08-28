@@ -62,6 +62,7 @@ class CodexOnboarding:
         self._attempts: dict[str, AsyncDeviceCodeLoginHandle] = {}
 
     async def start_device_authorization(self) -> CodexDeviceAuthorization:
+        handle: AsyncDeviceCodeLoginHandle | None = None
         try:
             handle = await self._client.login_chatgpt_device_code()
             authorization = CodexDeviceAuthorization(
@@ -70,6 +71,9 @@ class CodexOnboarding:
                 user_code=handle.user_code,
             )
         except Exception as error:
+            if handle is not None:
+                with suppress(Exception):
+                    await handle.cancel()
             raise CodexOnboardingError("ChatGPT authorization could not be started") from error
         self._attempts[authorization.login_id] = handle
         return authorization
