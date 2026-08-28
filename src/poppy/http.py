@@ -14,7 +14,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import HttpUrl
 from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import Response
-from starlette.types import Lifespan
+from starlette.types import ASGIApp, Lifespan, Receive, Scope, Send
 
 from poppy.adapters.codex_onboarding import CodexOnboardingError
 from poppy.adapters.github_onboarding import GitHubOnboarding, GitHubOnboardingError
@@ -106,12 +106,39 @@ class ReviewerRuntimePort(Protocol):
 
 
 class SetupRuntimePort(ReviewerRuntimePort, Protocol):
-    @property
-    def setup_closed(self) -> bool: ...
-
     def setup_access(self) -> AbstractAsyncContextManager[bool]: ...
 
     async def promote_if_ready(self) -> bool: ...
+
+
+class _SetupGateMiddleware:
+    def __init__(self, app: ASGIApp, *, runtime: SetupRuntimePort) -> None:
+        self._app = app
+        self._runtime = runtime
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or not _is_setup_path(scope["path"]):
+            await self._app(scope, receive, send)
+            return
+
+        async with self._runtime.setup_access() as setup_available:
+            if not setup_available:
+                response = _protect_setup_response(
+                    JSONResponse({"error": "not found"}, status_code=404)
+                )
+                await response(scope, receive, send)
+                return
+            await self._app(scope, receive, send)
+
+        state = scope.get("state")
+        if isinstance(state, dict) and state.get("promote_reviewer") is True:
+            try:
+                await self._runtime.promote_if_ready()
+            except RuntimeStateError:
+                logger.warning(
+                    "Poppy reviewer promotion failed",
+                    extra={"event": "reviewer_promotion_failed"},
+                )
 
 
 def create_setup_app(
@@ -135,48 +162,26 @@ def create_setup_app(
         call_next: RequestResponseEndpoint,
     ) -> Response:
         try:
-            is_setup_route = request.url.path == "/setup" or request.url.path.startswith("/setup/")
-            if not is_setup_route:
-                return _protect_setup_response(await call_next(request))
-
-            async with runtime.setup_access() as setup_available:
-                if not setup_available:
+            is_setup_route = _is_setup_path(request.url.path)
+            if is_setup_route and request.method not in {"GET", "HEAD", "OPTIONS"}:
+                session_token = request.cookies.get(SETUP_SESSION_COOKIE)
+                if request.headers.get("origin") != expected_origin or session_token is None:
                     return _protect_setup_response(
                         JSONResponse({"error": "not found"}, status_code=404)
                     )
-                if request.method not in {"GET", "HEAD", "OPTIONS"}:
-                    session_token = request.cookies.get(SETUP_SESSION_COOKIE)
-                    if request.headers.get("origin") != expected_origin or session_token is None:
-                        return _protect_setup_response(
-                            JSONResponse({"error": "not found"}, status_code=404)
-                        )
 
-                    csrf_token = await _setup_form_csrf_token(request)
-                    if csrf_token is None or not setup_session.mutation_is_authorized(
-                        session_token=session_token,
-                        csrf_token=csrf_token,
-                    ):
-                        return _protect_setup_response(
-                            JSONResponse({"error": "not found"}, status_code=404)
-                        )
-
-                response = await call_next(request)
-
-            should_promote = getattr(request.state, "promote_reviewer", False) or (
-                request.url.path == "/setup" and response.status_code == 200
-            )
-            if should_promote:
-                try:
-                    await runtime.promote_if_ready()
-                except RuntimeStateError:
-                    logger.warning(
-                        "Poppy reviewer promotion failed",
-                        extra={"event": "reviewer_promotion_failed"},
+                csrf_token = await _setup_form_csrf_token(request)
+                if csrf_token is None or not setup_session.mutation_is_authorized(
+                    session_token=session_token,
+                    csrf_token=csrf_token,
+                ):
+                    return _protect_setup_response(
+                        JSONResponse({"error": "not found"}, status_code=404)
                     )
 
-            async with runtime.setup_access() as setup_available:
-                if not setup_available:
-                    response = JSONResponse({"error": "not found"}, status_code=404)
+            response = await call_next(request)
+            if is_setup_route and request.url.path == "/setup" and response.status_code == 200:
+                request.state.promote_reviewer = True
             return _protect_setup_response(response)
         except SetupStateError:
             logger.exception(
@@ -186,6 +191,8 @@ def create_setup_app(
             return _protect_setup_response(
                 JSONResponse({"error": "setup unavailable"}, status_code=503)
             )
+
+    app.add_middleware(_SetupGateMiddleware, runtime=runtime)
 
     @app.get("/setup")
     async def setup(request: Request) -> Response:
@@ -394,6 +401,10 @@ def create_setup_app(
 def _single_query_parameter(request: Request, name: str) -> str | None:
     values = request.query_params.getlist(name)
     return values[0] if len(values) == 1 and values[0] else None
+
+
+def _is_setup_path(path: str) -> bool:
+    return path == "/setup" or path.startswith("/setup/")
 
 
 def _positive_decimal_query_parameter(request: Request, name: str) -> int | None:
@@ -608,7 +619,6 @@ async def _open_setup_access() -> AsyncIterator[bool]:
 
 class _UnavailableSetupRuntime:
     mode: RuntimeMode = "setup"
-    setup_closed: bool = False
 
     def active_reviewer(self) -> None:
         return None

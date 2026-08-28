@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import stat
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -16,6 +17,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
 from httpx import AsyncClient as ASGIClient
 
 import poppy.service as service_module
@@ -193,7 +195,7 @@ async def test_readiness_is_independent_of_integration_order(
 
     assert chatgpt_only.status_code == 200
     assert "Connect GitHub" in chatgpt_only.text
-    assert installed.status_code == 404
+    assert installed.status_code == 303
     assert health.json() == {"status": "ok", "mode": "reviewer"}
     assert closed_setup.status_code == 404
     assert len(reviewer.connections) == 1
@@ -201,7 +203,7 @@ async def test_readiness_is_independent_of_integration_order(
 
 
 @pytest.mark.asyncio
-async def test_promotion_waits_for_an_admitted_setup_request_and_hides_its_response(
+async def test_promotion_waits_for_an_admitted_setup_response_to_finish(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -222,10 +224,14 @@ async def test_promotion_waits_for_an_admitted_setup_request_and_hides_its_respo
     )
 
     @app.get("/setup/in-flight")
-    async def in_flight_setup_request() -> dict[str, str]:
-        setup_request_started.set()
-        await release_setup_request.wait()
-        return {"status": "setup data"}
+    async def in_flight_setup_request() -> StreamingResponse:
+        async def stream_setup_response() -> AsyncIterator[bytes]:
+            setup_request_started.set()
+            yield b"setup response started\n"
+            await release_setup_request.wait()
+            yield b"setup response finished\n"
+
+        return StreamingResponse(stream_setup_response(), media_type="text/plain")
 
     async with app.router.lifespan_context(app), setup_client(app) as client:
         csrf_token = await establish_setup_session(client, setup_url_from(caplog))
@@ -246,10 +252,11 @@ async def test_promotion_waits_for_an_admitted_setup_request_and_hides_its_respo
         assert blocked_webhook.status_code == 503
 
         release_setup_request.set()
-        hidden_setup = await admitted_setup
+        completed_setup = await admitted_setup
         promoted = await wait_for_mode(client, "reviewer")
 
-    assert hidden_setup.status_code == 404
+    assert completed_setup.status_code == 200
+    assert completed_setup.text.endswith("setup response finished\n")
     assert promoted.json() == {"status": "ok", "mode": "reviewer"}
     assert len(reviewer.connections) == 1
     await provider.aclose()
@@ -288,7 +295,7 @@ async def test_transient_runtime_failure_retries_from_the_live_setup_page(
         retry = await client.get("/setup")
         health = await client.get("/healthz")
 
-    assert retry.status_code == 404
+    assert retry.status_code == 200
     assert health.json() == {"status": "ok", "mode": "reviewer"}
     assert reviewer.attempts == 2
     assert provider_detail not in caplog.text
