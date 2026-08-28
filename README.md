@@ -70,16 +70,19 @@ connection actions are delivered by the following onboarding slices.
 ### Connect the private GitHub App
 
 From the protected `/setup` page, **Connect GitHub** starts GitHub's App Manifest flow. Poppy
-submits a private App whose homepage, webhook, manifest callback, and post-install setup URLs all
-derive from the configured public HTTPS origin. The manifest requests only `Checks: write`,
-`Pull requests: write`, `Issues: write`, and `Metadata: read`, and subscribes only to the
-`pull_request` event.
+submits a private App with a stable, instance-specific Poppy name. Its homepage, webhook, manifest
+callback, and post-install setup URLs all derive from the configured public HTTPS origin. The
+manifest requests only `Checks: write`, `Pull requests: write`, `Issues: write`, and
+`Metadata: read`, and subscribes only to the `pull_request` event.
 
-After registration, Poppy exchanges the callback code for the new App's ID, slug, private key,
-and webhook secret, then sends the Operator through GitHub's native installation screen. Choose
-the account and either **All repositories** or **Only select repositories** there. Poppy does not
-copy that selection into a repository database or local allowlist: the GitHub installation remains
-the source of truth as access is later added or removed.
+GitHub allows a private App to be installed only on the account that owns it. Leave the optional
+organization field empty to register Poppy for the Operator's personal repositories, or enter the
+organization login to register it for that organization's repositories. After registration, Poppy
+exchanges the callback code for the new App's ID, slug, private key, and webhook secret, then sends
+the Operator through GitHub's native installation screen. Choose either **All repositories** or
+**Only select repositories** there. Poppy does not copy that selection into a repository database
+or local allowlist: the GitHub installation remains the source of truth as access is later added or
+removed.
 
 The post-install callback is correlated to the pending Setup Session and is not trusted by itself.
 Poppy authenticates as the newly created App and verifies that the reported installation belongs
@@ -92,8 +95,11 @@ separate setup steps.
 The protocol behavior follows GitHub's current documentation:
 
 - [Registering a GitHub App from a manifest](https://docs.github.com/en/apps/sharing-github-apps/registering-a-github-app-from-a-manifest)
+- [Private GitHub App installation ownership](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/making-a-github-app-public-or-private#private-installation-flow)
 - [Create a GitHub App from a manifest REST endpoint](https://docs.github.com/en/rest/apps/apps?apiVersion=2026-03-10#create-a-github-app-from-a-manifest)
 - [Installing a GitHub App from a third party](https://docs.github.com/en/apps/using-github-apps/installing-a-github-app-from-a-third-party)
+- [Preserving correlation state in an App installation link](https://docs.github.com/en/apps/sharing-github-apps/sharing-your-github-app#sharing-your-github-app-via-an-install-link)
+- [Reviewing and modifying an installed GitHub App](https://docs.github.com/en/apps/using-github-apps/reviewing-and-modifying-installed-github-apps)
 - [Security guidance for the post-install setup URL](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/about-the-setup-url)
 - [Get an installation for the authenticated App REST endpoint](https://docs.github.com/en/rest/apps/apps?apiVersion=2026-03-10#get-an-installation-for-the-authenticated-app)
 - [Generating a JSON Web Token for a GitHub App](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-json-web-token-jwt-for-a-github-app)
