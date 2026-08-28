@@ -8,6 +8,14 @@ Poppy is a personal, reviewer-only pull-request gate for one human owner and onl
 The sole human who installs, configures, and can disable Poppy.
 _Avoid_: Customer, tenant, admin
 
+**Poppy Instance**:
+The single self-hosted Poppy runtime owned by the Operator and paired with the Operator's private GitHub App.
+_Avoid_: Shared service, SaaS tenant, control plane
+
+**Setup Session**:
+The one-time, token-protected bootstrap in which the Operator connects the Poppy Instance to GitHub and ChatGPT. It closes permanently after both connections succeed.
+_Avoid_: User account, login portal, dashboard
+
 **Managed Repository**:
 A GitHub repository on which the Operator has explicitly installed Poppy.
 _Avoid_: Monitored repository, arbitrary repository
