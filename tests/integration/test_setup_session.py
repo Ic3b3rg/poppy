@@ -191,7 +191,10 @@ async def test_setup_mutations_require_same_origin_and_csrf_token(
         cross_site = await client.post(
             "/setup",
             data=form,
-            headers={"origin": "https://attacker.example"},
+            headers={
+                "origin": "https://attacker.example",
+                "sec-fetch-site": "cross-site",
+            },
         )
         missing_origin = await client.post(
             "/setup",
@@ -219,8 +222,8 @@ async def test_setup_mutations_require_same_origin_and_csrf_token(
     ]
     assert [record.getMessage() for record in rejections] == [
         "Poppy Setup Session rejected mutation (csrf)",
-        "Poppy Setup Session rejected mutation (origin_mismatch)",
-        "Poppy Setup Session rejected mutation (origin_missing)",
+        "Poppy Setup Session rejected mutation (origin_mismatch, fetch_site=cross-site)",
+        "Poppy Setup Session rejected mutation (origin_missing, fetch_site=missing)",
     ]
 
 

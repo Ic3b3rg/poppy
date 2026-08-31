@@ -173,11 +173,16 @@ def create_setup_app(
                         rejection_reason = "origin_missing"
                     else:
                         rejection_reason = "origin_mismatch"
+                    fetch_site = request.headers.get("sec-fetch-site")
+                    if fetch_site not in {"same-origin", "same-site", "cross-site", "none"}:
+                        fetch_site = "missing"
                     logger.warning(
-                        "Poppy Setup Session rejected mutation (%s)",
+                        "Poppy Setup Session rejected mutation (%s, fetch_site=%s)",
                         rejection_reason,
+                        fetch_site,
                         extra={
                             "event": "setup_mutation_rejected",
+                            "fetch_site": fetch_site,
                             "reason": rejection_reason,
                         },
                     )
