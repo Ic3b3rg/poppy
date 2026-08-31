@@ -42,6 +42,7 @@ class PoppySettings(CodexHomeSettings):
         default=HttpUrl("https://localhost"),
         validation_alias=AliasChoices(
             "POPPY_PUBLIC_BASE_URL",
+            "SERVICE_URL_POPPY",
             "SERVICE_URL_POPPY_8000",
         ),
     )

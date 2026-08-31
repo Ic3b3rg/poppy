@@ -69,6 +69,7 @@ def test_empty_portable_url_falls_back_when_coolify_magic_is_absent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("POPPY_PUBLIC_BASE_URL", "")
+    monkeypatch.delenv("SERVICE_URL_POPPY", raising=False)
     monkeypatch.delenv("SERVICE_URL_POPPY_8000", raising=False)
 
     settings = PoppySettings(_env_file=None)
@@ -80,7 +81,11 @@ def test_coolify_generated_url_becomes_the_public_origin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("POPPY_PUBLIC_BASE_URL", raising=False)
-    monkeypatch.setenv("SERVICE_URL_POPPY_8000", "https://poppy.example")
+    monkeypatch.setenv("SERVICE_URL_POPPY", "https://poppy.example")
+    monkeypatch.setenv(
+        "SERVICE_URL_POPPY_8000",
+        "http://poppy.example:8000",
+    )
 
     settings = PoppySettings(_env_file=None)
 
@@ -91,11 +96,24 @@ def test_portable_public_url_overrides_the_coolify_generated_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("POPPY_PUBLIC_BASE_URL", "https://portable.example")
+    monkeypatch.setenv("SERVICE_URL_POPPY", "https://coolify.example")
     monkeypatch.setenv("SERVICE_URL_POPPY_8000", "https://coolify.example")
 
     settings = PoppySettings(_env_file=None)
 
     assert str(settings.public_base_url) == "https://portable.example/"
+
+
+def test_port_specific_coolify_url_remains_a_legacy_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("POPPY_PUBLIC_BASE_URL", raising=False)
+    monkeypatch.delenv("SERVICE_URL_POPPY", raising=False)
+    monkeypatch.setenv("SERVICE_URL_POPPY_8000", "https://legacy.example")
+
+    settings = PoppySettings(_env_file=None)
+
+    assert str(settings.public_base_url) == "https://legacy.example/"
 
 
 def test_partial_legacy_reviewer_credentials_are_rejected() -> None:

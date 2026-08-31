@@ -34,7 +34,8 @@ declares the image build, health check, internal port, private storage, and runt
    is `https://poppy-abc.example.com`. The suffix tells Coolify which internal container port to
    proxy; it does not expose public port 8000.
 3. Open **Configuration → Environment Variables**. Do not add a value. Coolify generates
-   `SERVICE_URL_POPPY_8000`, and Poppy uses that generated HTTPS origin directly.
+   `SERVICE_URL_POPPY_8000` and the public `SERVICE_URL_POPPY`; Poppy uses the latter HTTPS origin
+   directly.
 4. Open **Configuration → Persistent Storages** and confirm exactly one parsed mount:
    `poppy_data` at `/var/lib/poppy`. Do not create another mount.
 5. Select **Deploy**, open **Deployments**, and wait for a successful, healthy deployment.
