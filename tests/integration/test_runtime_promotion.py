@@ -14,6 +14,7 @@ import httpx
 import pytest
 from fastapi.responses import StreamingResponse
 
+import poppy.private_state as private_state_module
 import poppy.service as service_module
 from poppy.adapters.codex_onboarding import CodexDeviceAuthorization
 from poppy.adapters.github_onboarding import GitHubAppCredentials, GitHubInstallation
@@ -371,6 +372,77 @@ async def test_failed_session_removal_closes_setup_without_claiming_reviewer_mod
     assert closed_setup.status_code == 404
     assert webhook.status_code == 503
     assert len(reviewer.connections) == 1
+    await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_persisted_ready_marker_seals_setup_when_directory_sync_fails(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_key = github_private_key()
+    webhook_secret = "generated-webhook-secret"
+    provider = github_provider(private_key=private_key, webhook_secret=webhook_secret)
+    codex_onboarding = FakeCodexOnboarding()
+    configured = setup_settings(tmp_path)
+    caplog.set_level(logging.WARNING, logger="poppy.service")
+    app = create_service(
+        configured,
+        github_onboarding_client=provider,
+        codex_onboarding=codex_onboarding,
+        reviewer_adapter_factory=FakeReviewerAdapterFactory(),
+    )
+
+    async with app.router.lifespan_context(app), setup_client(app) as client:
+        csrf_token = await establish_setup_session(client, setup_url_from(caplog))
+        await connect_github(client, csrf_token=csrf_token)
+        await client.post(
+            "/setup/chatgpt/connect",
+            data={"csrf_token": csrf_token},
+            headers={"origin": "https://poppy.example"},
+        )
+
+        original_replace = private_state_module.os.replace
+        original_fsync = private_state_module.os.fsync
+        readiness_replaced = False
+        directory_sync_failed = False
+
+        def track_readiness_replace(source: object, destination: object) -> None:
+            nonlocal readiness_replaced
+            original_replace(source, destination)
+            if Path(destination).name == "readiness.json":
+                readiness_replaced = True
+
+        def fail_sync_after_readiness_replace(file_descriptor: int) -> None:
+            nonlocal directory_sync_failed
+            if (
+                readiness_replaced
+                and not directory_sync_failed
+                and stat.S_ISDIR(private_state_module.os.fstat(file_descriptor).st_mode)
+            ):
+                directory_sync_failed = True
+                raise OSError("synthetic readiness directory sync failure")
+            original_fsync(file_descriptor)
+
+        monkeypatch.setattr(private_state_module.os, "replace", track_readiness_replace)
+        monkeypatch.setattr(private_state_module.os, "fsync", fail_sync_after_readiness_replace)
+
+        codex_onboarding.complete()
+        unavailable = await wait_for_mode(client, "unavailable")
+        closed_setup = await client.get("/setup")
+        webhook = await post_signed_webhook(client, secret=webhook_secret)
+
+    persisted_readiness = json.loads(
+        (configured.data_dir / "readiness.json").read_text(encoding="utf-8")
+    )
+    assert directory_sync_failed
+    assert persisted_readiness == {"version": 1, "status": "ready"}
+    assert not (configured.data_dir / "setup-state.json").exists()
+    assert unavailable.json() == {"status": "ok", "mode": "unavailable"}
+    assert closed_setup.status_code == 404
+    assert webhook.status_code == 503
+    assert "synthetic readiness directory sync failure" not in caplog.text
     await provider.aclose()
 
 

@@ -247,7 +247,11 @@ class InstanceRuntime:
         try:
             if persist_readiness:
                 async with self._setup_gate.promotion():
-                    self._readiness.mark_ready()
+                    try:
+                        self._readiness.mark_ready()
+                    except RuntimeStateError:
+                        self._seal_setup_if_readiness_may_exist()
+                        raise
                     self._setup_closed = True
                     self._setup_session.close()
             else:
@@ -256,6 +260,15 @@ class InstanceRuntime:
             await active.close()
             raise RuntimeStateError(failure_message) from error
         self._active = active
+
+    def _seal_setup_if_readiness_may_exist(self) -> None:
+        try:
+            should_seal = self._readiness.is_ready()
+        except RuntimeStateError:
+            should_seal = True
+        if should_seal:
+            self._setup_closed = True
+            self._setup_session.close()
 
     def _read_connection(self) -> ReviewerConnection | None:
         try:
