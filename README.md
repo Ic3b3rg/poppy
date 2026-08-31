@@ -27,6 +27,12 @@ and its acceptance criteria are in [SPEC.md](SPEC.md).
 
 No workflow file is needed in the repositories being reviewed.
 
+## Deploy on Coolify
+
+Follow the single-path [Coolify operator guide](docs/coolify.md). It starts at **+ New**, requires no
+pre-created GitHub or OpenAI credentials, and ends with a real pull-request review plus stop/start
+and redeploy checks.
+
 Poppy keeps no repository database. It sends bounded PR metadata and textual patches to OpenAI
 through Codex so the model can perform the review. Poppy itself makes application calls only to
 GitHub and OpenAI.
@@ -48,8 +54,8 @@ cd poppy
 cp .env.example .env
 chmod 600 .env
 # Edit POPPY_PUBLIC_BASE_URL in .env, then:
-docker compose up -d --build
-docker compose logs poppy
+docker compose -f compose.yaml -f compose.host.yaml up -d --build
+docker compose -f compose.yaml -f compose.host.yaml logs poppy
 ```
 
 On Coolify, deploy this repository as a Docker Compose resource and assign the `poppy` service an
@@ -57,11 +63,10 @@ HTTPS domain routed to port `8000`. The Compose definition declares Coolify's
 `SERVICE_URL_POPPY_8000` value and uses it as Poppy's public origin; `POPPY_PUBLIC_BASE_URL`
 remains the explicit override for other hosts.
 
-The existing `poppy_codex` volume is the sole durable store. Setup state is atomically persisted
-there with restrictive permissions and survives container replacement alongside any existing
-Codex login. The container root filesystem stays read-only; only that volume and the bounded
-`/tmp` tmpfs are writable. The optional Compose secret uses an empty source on fresh deployments,
-so a PEM is not required to enter setup mode.
+The `poppy_data` volume is the sole durable store. Setup state is atomically persisted there with
+restrictive permissions and survives container replacement alongside the Codex login. The
+container root filesystem stays read-only; only that volume and the bounded `/tmp` tmpfs are
+writable.
 
 A healthy fresh instance answers `GET /healthz` with `{"status":"ok","mode":"setup"}`. Review
 webhooks return `503 Service Unavailable` until onboarding is complete. The GitHub and ChatGPT
@@ -127,7 +132,7 @@ the temporary verification URL and user code, while normal logs expose only sani
 the login ID, account details, access token, or refresh token.
 
 Codex owns token persistence and refresh. Poppy forces file-backed credential storage so Codex
-writes `auth.json` beneath `POPPY_CODEX_HOME`, which is the existing private `poppy_codex` volume.
+writes `auth.json` beneath `POPPY_CODEX_HOME`, which is inside the private `poppy_data` volume.
 Poppy writes only non-credential setup status to `chatgpt-setup.json`. A completed connection
 survives container replacement; an interrupted pending attempt resumes as failed and retryable,
 and the mere presence of a partial `auth.json` is never treated as connected.
@@ -178,25 +183,17 @@ docker compose stop
 docker compose start
 ```
 
-Before readiness, the protected Setup Session and any partial setup state remain in `poppy_codex`
+Before readiness, the protected Setup Session and any partial setup state remain in `poppy_data`
 across these operations. A link is logged for a fresh volume, and a distinct recovery link is
 logged after a restart only when the cookie handoff was not yet confirmed. After readiness, Poppy
 starts directly in reviewer mode and never creates or logs another Setup Session.
-
-An existing pre-onboarding reviewer keeps its `.env`, `secrets/github-app.pem`, and
-`poppy_codex` volume. Before its first `docker compose up` on this version, add this Compose-only
-source path to the existing `.env` so the old PEM is mounted at the same in-container secret path:
-
-```dotenv
-POPPY_GITHUB_PRIVATE_KEY_SOURCE=./secrets/github-app.pem
-```
 
 To update Poppy:
 
 ```bash
 git pull --ff-only
-docker compose build --pull
-docker compose up -d
+docker compose -f compose.yaml -f compose.host.yaml build --pull
+docker compose -f compose.yaml -f compose.host.yaml up -d
 ```
 
 ## Review policy
