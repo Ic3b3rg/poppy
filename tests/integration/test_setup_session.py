@@ -202,11 +202,16 @@ async def test_setup_mutations_require_same_origin_and_csrf_token(
     assert missing_csrf.status_code == 404
     assert cross_site.status_code == 404
     assert authorized.status_code == 405
-    assert [
-        getattr(record, "reason", None)
+    rejections = [
+        record
         for record in caplog.records
         if getattr(record, "event", None) == "setup_mutation_rejected"
-    ] == ["csrf", "origin"]
+    ]
+    assert [getattr(record, "reason", None) for record in rejections] == ["csrf", "origin"]
+    assert [record.getMessage() for record in rejections] == [
+        "Poppy Setup Session rejected mutation (csrf)",
+        "Poppy Setup Session rejected mutation (origin)",
+    ]
 
 
 @pytest.mark.asyncio

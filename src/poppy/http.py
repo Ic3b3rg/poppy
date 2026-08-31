@@ -166,11 +166,13 @@ def create_setup_app(
             if is_setup_route and request.method not in {"GET", "HEAD", "OPTIONS"}:
                 session_token = request.cookies.get(SETUP_SESSION_COOKIE)
                 if request.headers.get("origin") != expected_origin or session_token is None:
+                    rejection_reason = "session" if session_token is None else "origin"
                     logger.warning(
-                        "Poppy Setup Session rejected mutation",
+                        "Poppy Setup Session rejected mutation (%s)",
+                        rejection_reason,
                         extra={
                             "event": "setup_mutation_rejected",
-                            "reason": "session" if session_token is None else "origin",
+                            "reason": rejection_reason,
                         },
                     )
                     return _protect_setup_response(
@@ -183,7 +185,7 @@ def create_setup_app(
                     csrf_token=csrf_token,
                 ):
                     logger.warning(
-                        "Poppy Setup Session rejected mutation",
+                        "Poppy Setup Session rejected mutation (csrf)",
                         extra={"event": "setup_mutation_rejected", "reason": "csrf"},
                     )
                     return _protect_setup_response(
