@@ -165,8 +165,14 @@ def create_setup_app(
             is_setup_route = _is_setup_path(request.url.path)
             if is_setup_route and request.method not in {"GET", "HEAD", "OPTIONS"}:
                 session_token = request.cookies.get(SETUP_SESSION_COOKIE)
-                if request.headers.get("origin") != expected_origin or session_token is None:
-                    rejection_reason = "session" if session_token is None else "origin"
+                presented_origin = request.headers.get("origin")
+                if presented_origin != expected_origin or session_token is None:
+                    if session_token is None:
+                        rejection_reason = "session"
+                    elif presented_origin is None:
+                        rejection_reason = "origin_missing"
+                    else:
+                        rejection_reason = "origin_mismatch"
                     logger.warning(
                         "Poppy Setup Session rejected mutation (%s)",
                         rejection_reason,

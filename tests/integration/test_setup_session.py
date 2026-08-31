@@ -193,6 +193,10 @@ async def test_setup_mutations_require_same_origin_and_csrf_token(
             data=form,
             headers={"origin": "https://attacker.example"},
         )
+        missing_origin = await client.post(
+            "/setup",
+            data=form,
+        )
         authorized = await client.post(
             "/setup",
             data=form,
@@ -201,16 +205,22 @@ async def test_setup_mutations_require_same_origin_and_csrf_token(
 
     assert missing_csrf.status_code == 404
     assert cross_site.status_code == 404
+    assert missing_origin.status_code == 404
     assert authorized.status_code == 405
     rejections = [
         record
         for record in caplog.records
         if getattr(record, "event", None) == "setup_mutation_rejected"
     ]
-    assert [getattr(record, "reason", None) for record in rejections] == ["csrf", "origin"]
+    assert [getattr(record, "reason", None) for record in rejections] == [
+        "csrf",
+        "origin_mismatch",
+        "origin_missing",
+    ]
     assert [record.getMessage() for record in rejections] == [
         "Poppy Setup Session rejected mutation (csrf)",
-        "Poppy Setup Session rejected mutation (origin)",
+        "Poppy Setup Session rejected mutation (origin_mismatch)",
+        "Poppy Setup Session rejected mutation (origin_missing)",
     ]
 
 
