@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, HttpUrl, SecretStr, field_validator, model_validator
+from pydantic import AliasChoices, Field, HttpUrl, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from poppy.adapters.codex import DEFAULT_MODEL
@@ -26,6 +26,7 @@ class CodexHomeSettings(BaseSettings):
         env_file_encoding="utf-8",
         env_ignore_empty=True,
         extra="ignore",
+        populate_by_name=True,
     )
 
     codex_home: Path = Path("/var/lib/poppy/codex")
@@ -37,7 +38,13 @@ class PoppySettings(CodexHomeSettings):
     github_webhook_secret: SecretStr | None = Field(default=None, min_length=16)
 
     data_dir: Path = Path("/var/lib/poppy")
-    public_base_url: HttpUrl = HttpUrl("https://localhost")
+    public_base_url: HttpUrl = Field(
+        default=HttpUrl("https://localhost"),
+        validation_alias=AliasChoices(
+            "POPPY_PUBLIC_BASE_URL",
+            "SERVICE_URL_POPPY_8000",
+        ),
+    )
     codex_workspace: Path = Path("/var/empty/poppy")
     model: str = Field(default=DEFAULT_MODEL, min_length=1, max_length=100)
     review_language: str = Field(default="Italian", min_length=1, max_length=80)

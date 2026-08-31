@@ -10,7 +10,6 @@ services:
         required: false
     environment:
       SERVICE_URL_POPPY_8000: /
-      POPPY_PUBLIC_BASE_URL: ${POPPY_PUBLIC_BASE_URL:-${SERVICE_URL_POPPY_8000}}
       POPPY_DATA_DIR: /var/lib/poppy
       POPPY_CODEX_HOME: /var/lib/poppy/codex
       POPPY_CODEX_WORKSPACE: /var/empty/poppy

@@ -18,11 +18,11 @@ pytestmark = pytest.mark.container
 def test_compose_configuration_is_valid_and_portable() -> None:
     docker = require_docker_daemon()
     environment = compose_environment()
-    environment["POPPY_PUBLIC_BASE_URL"] = "https://poppy.example"
     compose = render_compose(docker, environment)
     service = compose["services"]["poppy"]
 
-    assert service["environment"]["POPPY_PUBLIC_BASE_URL"] == "https://poppy.example"
+    assert service["environment"]["SERVICE_URL_POPPY_8000"] == "/"
+    assert "POPPY_PUBLIC_BASE_URL" not in service["environment"]
     assert service["volumes"] == [
         {
             "type": "volume",
@@ -56,19 +56,6 @@ def test_host_override_publishes_only_the_loopback_port() -> None:
             "protocol": "tcp",
         }
     ]
-
-
-def test_compose_uses_the_coolify_generated_https_origin() -> None:
-    docker = require_docker_daemon()
-    environment = compose_environment()
-    environment["SERVICE_URL_POPPY_8000"] = "https://poppy.example"
-
-    compose = render_compose(docker, environment)
-
-    assert (
-        compose["services"]["poppy"]["environment"]["POPPY_PUBLIC_BASE_URL"]
-        == "https://poppy.example"
-    )
 
 
 def test_production_container_health_and_private_volume_survive_replacement() -> None:

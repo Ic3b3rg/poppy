@@ -28,9 +28,8 @@ def test_compose_preserves_private_instance_data_and_hardens_the_container() -> 
     assert "secrets" not in compose
     assert not Path(".poppy-empty-secret").exists()
     assert service["environment"]["SERVICE_URL_POPPY_8000"] == "/"
-    assert service["environment"]["POPPY_PUBLIC_BASE_URL"] == (
-        "${POPPY_PUBLIC_BASE_URL:-${SERVICE_URL_POPPY_8000}}"
-    )
+    assert "POPPY_PUBLIC_BASE_URL" not in service["environment"]
+    assert "${" not in str(service["environment"])
     assert service["environment"]["POPPY_DATA_DIR"] == "/var/lib/poppy"
     assert service["environment"]["POPPY_CODEX_HOME"] == "/var/lib/poppy/codex"
     assert service["env_file"] == [{"path": ".env", "required": False}]

@@ -60,8 +60,8 @@ docker compose -f compose.yaml -f compose.host.yaml logs poppy
 
 On Coolify, deploy this repository as a Docker Compose resource and assign the `poppy` service an
 HTTPS domain routed to port `8000`. The Compose definition declares Coolify's
-`SERVICE_URL_POPPY_8000` value and uses it as Poppy's public origin; `POPPY_PUBLIC_BASE_URL`
-remains the explicit override for other hosts.
+`SERVICE_URL_POPPY_8000` value, which Poppy uses as its public origin. `POPPY_PUBLIC_BASE_URL`
+remains the higher-priority explicit setting for other hosts.
 
 The `poppy_data` volume is the sole durable store. Setup state is atomically persisted there with
 restrictive permissions and survives container replacement alongside the Codex login. The
