@@ -660,13 +660,14 @@ async def test_ready_restart_reuses_one_runtime_client_pair_and_closes_each_once
     github_client = MagicMock(spec=httpx.AsyncClient)
     github_client.aclose = AsyncMock()
     github_client.get = AsyncMock(return_value=validated_installation_response())
-    require_account = AsyncMock(return_value="plus")
+    account_metadata = "private-plan-metadata"
+    require_account = AsyncMock(return_value=account_metadata)
     codex_factory = MagicMock(return_value=codex_client)
     github_factory = MagicMock(return_value=github_client)
     monkeypatch.setattr(service_module, "AsyncCodex", codex_factory)
     monkeypatch.setattr(service_module.httpx, "AsyncClient", github_factory)
     monkeypatch.setattr(service_module, "require_chatgpt_account", require_account)
-    caplog.set_level(logging.WARNING, logger="poppy.service")
+    caplog.set_level(logging.INFO, logger="poppy.service")
 
     app = create_service(configured)
     async with app.router.lifespan_context(app), setup_client(app) as client:
@@ -680,6 +681,8 @@ async def test_ready_restart_reuses_one_runtime_client_pair_and_closes_each_once
     codex_client.close.assert_awaited_once()
     github_client.aclose.assert_awaited_once()
     assert "Poppy Setup Session" not in caplog.text
+    assert account_metadata not in caplog.text
+    assert not any(hasattr(record, "chatgpt_plan") for record in caplog.records)
 
 
 @pytest.mark.asyncio

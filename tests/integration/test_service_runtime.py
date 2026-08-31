@@ -15,12 +15,14 @@ from poppy.service import RuntimeConfigurationError, create_service
 async def test_service_starts_authenticated_codex_and_closes_resources(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     codex_client = MagicMock()
     codex_client.close = AsyncMock()
     github_client = MagicMock(spec=httpx.AsyncClient)
     github_client.aclose = AsyncMock()
-    require_account = AsyncMock(return_value="plus")
+    account_metadata = "private-plan-metadata"
+    require_account = AsyncMock(return_value=account_metadata)
     monkeypatch.setattr(service_module, "AsyncCodex", MagicMock(return_value=codex_client))
     monkeypatch.setattr(
         service_module.httpx,
@@ -28,6 +30,7 @@ async def test_service_starts_authenticated_codex_and_closes_resources(
         MagicMock(return_value=github_client),
     )
     monkeypatch.setattr(service_module, "require_chatgpt_account", require_account)
+    caplog.set_level("INFO", logger="poppy.service")
 
     app = create_service(settings(tmp_path))
 
@@ -38,6 +41,8 @@ async def test_service_starts_authenticated_codex_and_closes_resources(
             health = await client.get("/healthz")
 
     assert health.json() == {"status": "ok", "mode": "reviewer"}
+    assert account_metadata not in caplog.text
+    assert not any(hasattr(record, "chatgpt_plan") for record in caplog.records)
     codex_client.close.assert_awaited_once()
     github_client.aclose.assert_awaited_once()
 

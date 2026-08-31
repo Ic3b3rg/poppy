@@ -92,8 +92,8 @@ def create_service(
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         try:
-            plan = await require_chatgpt_account(codex_client)
-            logger.info("Codex authenticated with ChatGPT", extra={"chatgpt_plan": plan})
+            await require_chatgpt_account(codex_client)
+            logger.info("Codex authenticated with ChatGPT")
             yield
         finally:
             await scheduler.close()
@@ -135,8 +135,8 @@ class _ProductionReviewerAdapterFactory:
             app=app,
             installation_id=connection.installation_id,
         )
-        plan = await require_chatgpt_account(self._codex_client)
-        logger.info("Codex authenticated with ChatGPT", extra={"chatgpt_plan": plan})
+        await require_chatgpt_account(self._codex_client)
+        logger.info("Codex authenticated with ChatGPT")
         return _build_reviewer_adapters(
             settings=self._settings,
             app_id=connection.app_id,

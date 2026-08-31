@@ -244,6 +244,7 @@ class InstanceRuntime:
         failure_message: str,
     ) -> None:
         active = await self._build_reviewer(connection)
+        published = False
         try:
             if persist_readiness:
                 async with self._setup_gate.promotion():
@@ -254,12 +255,17 @@ class InstanceRuntime:
                         raise
                     self._setup_closed = True
                     self._setup_session.close()
+                    self._active = active
+                    published = True
             else:
                 self._setup_session.close()
+                self._active = active
+                published = True
         except (RuntimeStateError, SetupStateError) as error:
-            await active.close()
             raise RuntimeStateError(failure_message) from error
-        self._active = active
+        finally:
+            if not published:
+                await active.close()
 
     def _seal_setup_if_readiness_may_exist(self) -> None:
         try:
