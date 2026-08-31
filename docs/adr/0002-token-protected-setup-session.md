@@ -6,9 +6,12 @@ rotated atomically while a pending Secure, HttpOnly, SameSite session cookie is 
 browser. The first authenticated page request confirms the handoff, removes recoverable plaintext
 tokens from durable state, and retains only the active session digest. If delivery is interrupted,
 a restart logs the already-persisted recovery link while every older link remains invalid. Unsafe
-setup requests additionally require the same public origin and a session-bound CSRF token. This
-keeps setup state server-side, removes the presented secret from browser history, and lets partial
-setup survive restarts without introducing an account system or database.
+setup requests additionally require browser same-origin evidence and a session-bound CSRF token.
+Poppy accepts either the exact public `Origin` or the browser-controlled
+`Sec-Fetch-Site: same-origin` signal, which preserves the gate when a trusted reverse proxy changes
+the former. Cross-site and same-site signals remain rejected. This keeps setup state server-side,
+removes the presented secret from browser history, and lets partial setup survive restarts without
+introducing an account system or database.
 
 Provider redirect callbacks are the deliberate exception to the local-mutation rule: GitHub cannot
 carry Poppy's session-bound CSRF token or a reliable same-origin `Origin` header through its
