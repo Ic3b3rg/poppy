@@ -169,6 +169,7 @@ async def test_setup_mutations_require_same_origin_and_csrf_token(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level(logging.INFO, logger="poppy.service")
+    caplog.set_level(logging.WARNING, logger="poppy.http")
     app = create_service(setup_settings(tmp_path))
     setup_url = setup_url_from(caplog)
 
@@ -201,6 +202,11 @@ async def test_setup_mutations_require_same_origin_and_csrf_token(
     assert missing_csrf.status_code == 404
     assert cross_site.status_code == 404
     assert authorized.status_code == 405
+    assert [
+        getattr(record, "reason", None)
+        for record in caplog.records
+        if getattr(record, "event", None) == "setup_mutation_rejected"
+    ] == ["csrf", "origin"]
 
 
 @pytest.mark.asyncio
