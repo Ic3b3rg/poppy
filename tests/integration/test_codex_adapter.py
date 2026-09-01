@@ -73,7 +73,12 @@ async def test_review_uses_isolated_read_only_thread_and_maps_valid_json(
     assert turn_args.kwargs["model"] == "gpt-5.6-luna"
     assert turn_args.kwargs["approval_mode"] is ApprovalMode.deny_all
     assert turn_args.kwargs["sandbox"] is Sandbox.read_only
-    assert turn_args.kwargs["output_schema"]["additionalProperties"] is False
+    output_schema = turn_args.kwargs["output_schema"]
+    assert output_schema["additionalProperties"] is False
+    finding_schema = output_schema["$defs"]["_FindingOutput"]
+    assert set(finding_schema["required"]) == set(finding_schema["properties"])
+    for location_field in ("file_path", "line"):
+        assert {"type": "null"} in finding_schema["properties"][location_field]["anyOf"]
     turn.run.assert_awaited_once_with()
 
 

@@ -35,8 +35,8 @@ class _FindingOutput(BaseModel):
     explanation: str = Field(min_length=1, max_length=2_000)
     evidence: str = Field(min_length=1, max_length=2_000)
     suggested_response: str = Field(min_length=1, max_length=2_000)
-    file_path: str | None = Field(default=None, min_length=1, max_length=1_024)
-    line: int | None = Field(default=None, ge=1)
+    file_path: str | None = Field(min_length=1, max_length=1_024)
+    line: int | None = Field(ge=1)
 
 
 class _ReviewOutput(BaseModel):
