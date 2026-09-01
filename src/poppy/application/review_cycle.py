@@ -317,8 +317,7 @@ def _inline_review_comments(
     result: ReviewResult,
 ) -> tuple[InlineReviewComment, ...]:
     commentable_lines = {
-        changed_file.path: _right_side_lines(changed_file.patch)
-        for changed_file in snapshot.files
+        changed_file.path: _right_side_lines(changed_file.patch) for changed_file in snapshot.files
     }
     comments: list[InlineReviewComment] = []
     for finding in order_findings(result.findings):

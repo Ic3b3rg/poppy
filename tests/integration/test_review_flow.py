@@ -149,9 +149,7 @@ async def test_rerun_label_schedules_latest_pull_request_state() -> None:
     secret = b"test-webhook-secret"
     scheduler = FakeScheduler()
     app = create_app(webhook_secret=secret, scheduler=scheduler)
-    body = json.dumps(
-        webhook_payload(action="labeled", label="poppy:rerun")
-    ).encode()
+    body = json.dumps(webhook_payload(action="labeled", label="poppy:rerun")).encode()
 
     response = await post_webhook(app, body, secret=secret)
 
@@ -233,9 +231,11 @@ async def test_review_cycle_publishes_labels_review_and_check() -> None:
             line=18,
             body=(
                 "### 🟠 HIGH · Missing authorization\n\n"
-                "The new endpoint does not check the caller.\n\n"
-                "**Evidence:** The handler calls the service directly.\n\n"
-                "**Suggested fix:** Require the repository owner role."
+                "<p>The new endpoint does not check the caller.</p>\n\n"
+                "<p><strong>Evidence:</strong> The handler calls the service "
+                "directly.</p>\n\n"
+                "<p><strong>Suggested fix:</strong> Require the repository owner "
+                "role.</p>"
             ),
         ),
     )

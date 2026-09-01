@@ -89,9 +89,7 @@ def normalize_pull_request_webhook(
         return None
     if payload.action == "edited" and not REVIEW_RELEVANT_EDITS.intersection(payload.changes):
         return None
-    if payload.action == "labeled" and (
-        payload.label is None or payload.label.name != RERUN_LABEL
-    ):
+    if payload.action == "labeled" and (payload.label is None or payload.label.name != RERUN_LABEL):
         return None
 
     return ReviewRequest(

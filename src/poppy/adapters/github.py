@@ -306,15 +306,16 @@ class GitHubAdapter:
 
     async def _ensure_label(self, ref: PullRequestRef, label: str) -> None:
         encoded = quote(label, safe="")
+        label_path = f"/repos/{ref.owner}/{ref.repository}/labels/{encoded}"
         response = await self._installation_request(
             ref.installation_id,
             "GET",
-            f"/repos/{ref.owner}/{ref.repository}/labels/{encoded}",
+            label_path,
             expected_statuses=(200, 404),
         )
         if response.status_code == 200:
             return
-        await self._installation_request(
+        creation = await self._installation_request(
             ref.installation_id,
             "POST",
             f"/repos/{ref.owner}/{ref.repository}/labels",
@@ -323,8 +324,19 @@ class GitHubAdapter:
                 "color": _label_color(label),
                 "description": _label_description(label),
             },
-            expected_statuses=(201,),
+            expected_statuses=(201, 422),
         )
+        if creation.status_code == 201:
+            return
+
+        confirmation = await self._installation_request(
+            ref.installation_id,
+            "GET",
+            label_path,
+            expected_statuses=(200, 404),
+        )
+        if confirmation.status_code != 200:
+            raise GitHubError("GitHub label creation could not be confirmed")
 
     async def _installation_request(
         self,

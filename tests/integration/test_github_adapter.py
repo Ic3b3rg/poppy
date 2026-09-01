@@ -217,9 +217,7 @@ async def test_completed_review_removes_applied_rerun_label() -> None:
             deleted_labels.append(path)
             return httpx.Response(204)
         if path == "/repos/Ic3b3rg/example/issues/7/labels" and request.method == "POST":
-            assert json.loads(request.content) == {
-                "labels": ["poppy:size/s", "poppy:blocked"]
-            }
+            assert json.loads(request.content) == {"labels": ["poppy:size/s", "poppy:blocked"]}
             return json_response(200, [])
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
@@ -229,9 +227,44 @@ async def test_completed_review_removes_applied_rerun_label() -> None:
             ("poppy:size/s", "poppy:blocked"),
         )
 
-    assert deleted_labels == [
-        "/repos/Ic3b3rg/example/issues/7/labels/poppy:rerun"
-    ]
+    assert deleted_labels == ["/repos/Ic3b3rg/example/issues/7/labels/poppy:rerun"]
+
+
+@pytest.mark.asyncio
+async def test_label_creation_tolerates_another_review_winning_the_race() -> None:
+    rerun_reads = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal rerun_reads
+        path = request.url.path
+        if path.endswith("/access_tokens"):
+            return installation_token_response()
+        if path == "/repos/Ic3b3rg/example/issues/7/labels" and request.method == "GET":
+            return json_response(200, [])
+        if path in {
+            "/repos/Ic3b3rg/example/labels/poppy:size/s",
+            "/repos/Ic3b3rg/example/labels/poppy:blocked",
+        }:
+            return json_response(200, {"name": path.rsplit("/", 1)[-1]})
+        if path == "/repos/Ic3b3rg/example/labels/poppy:rerun":
+            rerun_reads += 1
+            if rerun_reads == 1:
+                return json_response(404, {"message": "Not Found"})
+            return json_response(200, {"name": "poppy:rerun"})
+        if path == "/repos/Ic3b3rg/example/labels" and request.method == "POST":
+            assert json.loads(request.content)["name"] == "poppy:rerun"
+            return json_response(422, {"message": "Validation Failed"})
+        if path == "/repos/Ic3b3rg/example/issues/7/labels" and request.method == "POST":
+            return json_response(200, [])
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    async with github_adapter(handler) as adapter:
+        await adapter.replace_poppy_labels(
+            pull_request_ref(),
+            ("poppy:size/s", "poppy:blocked"),
+        )
+
+    assert rerun_reads == 2
 
 
 @pytest.mark.asyncio

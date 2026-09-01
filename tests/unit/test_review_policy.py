@@ -237,9 +237,48 @@ def test_orders_and_formats_findings_by_severity() -> None:
     assert critical < high < medium < low
     assert "| Severity | Finding | Location |" in body
     assert body.count("<details>") == 4
-    assert "**Evidence:**" in body
-    assert "**Suggested fix:**" in body
+    assert "<strong>Evidence:</strong>" in body
+    assert "<strong>Suggested fix:</strong>" in body
     assert "`poppy:rerun`" in body
+
+
+def test_escapes_untrusted_model_text_without_breaking_review_layout() -> None:
+    finding = Finding(
+        severity=Severity.CRITICAL,
+        title="Broken | title\n</summary><h1>Injected</h1>",
+        explanation="<script>alert('explanation')</script>\nStill relevant.",
+        evidence="<details>fake evidence</details>",
+        suggested_response="</details><h1>fake fix</h1>",
+        file_path="src/<unsafe>.py",
+        line=12,
+    )
+    result = ReviewResult(
+        summary="<h1>Injected summary</h1>\nSummary continues.",
+        risk=Severity.CRITICAL,
+        findings=(finding,),
+    )
+    decision = decide_gate(
+        result.findings,
+        blocking_severity=Severity.HIGH,
+        is_draft=False,
+        is_complete=True,
+    )
+
+    body = render_review(
+        result=result,
+        decision=decision,
+        change_size=ChangeSize.XS,
+        changed_lines=25,
+        head_sha="0123456789abcdef",
+    )
+
+    assert body.count("<details>") == 1
+    assert body.count("</details>") == 1
+    assert "<script>" not in body
+    assert "<h1>Injected" not in body
+    assert "&lt;script&gt;" in body
+    assert "&lt;/summary&gt;&lt;h1&gt;Injected&lt;/h1&gt;" in body
+    assert "Broken &#124; title" in body
 
 
 def test_renders_no_findings_without_empty_sections() -> None:

@@ -170,7 +170,7 @@ def render_review(
             f" · Commit `{head_sha[:7]}`"
         ),
         "",
-        result.summary,
+        f"<p>{_render_plain_text(result.summary)}</p>",
         "",
         "### Findings",
     ]
@@ -191,7 +191,7 @@ def render_review(
         marker = _SEVERITY_MARKER[finding.severity]
         location = _render_location(finding)
         rendered_location = (
-            f"<code>{escape(location)}</code>" if location is not None else "—"
+            f"<code>{_render_single_line(location)}</code>" if location is not None else "—"
         )
         lines.append(
             "| "
@@ -209,15 +209,26 @@ def render_review(
                 (
                     f"<summary>{marker} <strong>"
                     f"{finding.severity.value.upper()}</strong> · "
-                    f"{escape(finding.title)}</summary>"
+                    f"{_render_single_line(finding.title)}</summary>"
                 ),
                 "",
-                *((f"**Location:** <code>{escape(location)}</code>", "") if location else ()),
-                finding.explanation,
+                *(
+                    (
+                        "<p><strong>Location:</strong> "
+                        f"<code>{_render_single_line(location)}</code></p>",
+                        "",
+                    )
+                    if location
+                    else ()
+                ),
+                f"<p>{_render_plain_text(finding.explanation)}</p>",
                 "",
-                f"**Evidence:** {finding.evidence}",
+                (f"<p><strong>Evidence:</strong> {_render_plain_text(finding.evidence)}</p>"),
                 "",
-                f"**Suggested fix:** {finding.suggested_response}",
+                (
+                    "<p><strong>Suggested fix:</strong> "
+                    f"{_render_plain_text(finding.suggested_response)}</p>"
+                ),
                 "",
                 "</details>",
             ]
@@ -227,9 +238,7 @@ def render_review(
 
 
 def order_findings(findings: Sequence[Finding]) -> tuple[Finding, ...]:
-    return tuple(
-        sorted(findings, key=lambda finding: finding.severity.rank, reverse=True)
-    )
+    return tuple(sorted(findings, key=lambda finding: finding.severity.rank, reverse=True))
 
 
 def severity_marker(severity: Severity) -> str:
@@ -237,17 +246,19 @@ def severity_marker(severity: Severity) -> str:
 
 
 def render_finding_comment(finding: Finding) -> str:
-    title = escape(" ".join(finding.title.split()))
+    title = _render_single_line(finding.title)
     return "\n".join(
         (
-            f"### {severity_marker(finding.severity)} "
-            f"{finding.severity.value.upper()} · {title}",
+            f"### {severity_marker(finding.severity)} {finding.severity.value.upper()} · {title}",
             "",
-            finding.explanation,
+            f"<p>{_render_plain_text(finding.explanation)}</p>",
             "",
-            f"**Evidence:** {finding.evidence}",
+            (f"<p><strong>Evidence:</strong> {_render_plain_text(finding.evidence)}</p>"),
             "",
-            f"**Suggested fix:** {finding.suggested_response}",
+            (
+                "<p><strong>Suggested fix:</strong> "
+                f"{_render_plain_text(finding.suggested_response)}</p>"
+            ),
         )
     )
 
@@ -264,7 +275,16 @@ def _with_rerun_footer(lines: list[str]) -> str:
 
 
 def _escape_table_cell(value: str) -> str:
-    return " ".join(value.split()).replace("|", "\\|")
+    return _render_single_line(value).replace("|", "&#124;")
+
+
+def _render_single_line(value: str) -> str:
+    return escape(" ".join(value.split()))
+
+
+def _render_plain_text(value: str) -> str:
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n")
+    return escape(normalized).replace("\n", "<br>\n")
 
 
 def _render_location(finding: Finding) -> str | None:
