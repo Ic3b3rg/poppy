@@ -146,7 +146,7 @@ def render_review(
         GateConclusion.ACTION_REQUIRED: "Action required",
     }[decision.conclusion]
     lines = [
-        "## 🌺 Poppy review",
+        "## 🤖 Poppy review",
         "",
         f"**Commit:** `{head_sha[:7]}`  ",
         f"**Change size:** {change_size.name} ({changed_lines} lines)  ",

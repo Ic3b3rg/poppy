@@ -179,7 +179,7 @@ def test_renders_one_concise_formal_review() -> None:
         head_sha="0123456789abcdef",
     )
 
-    assert "Poppy review" in body
+    assert body.startswith("## 🤖 Poppy review")
     assert "`0123456`" in body
     assert "XS (37 lines)" in body
     assert "High" in body

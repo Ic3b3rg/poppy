@@ -234,7 +234,7 @@ class ReviewCycle:
         change_size = classify_change_size(snapshot.changed_lines)
         body = "\n".join(
             (
-                "## 🌺 Poppy review",
+                "## 🤖 Poppy review",
                 "",
                 f"**Commit:** `{snapshot.head_sha[:7]}`  ",
                 f"**Change size:** {change_size.name} ({snapshot.changed_lines} lines)  ",

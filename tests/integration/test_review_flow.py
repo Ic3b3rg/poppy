@@ -220,6 +220,7 @@ async def test_unavailable_review_publishes_action_required_without_diagnostic()
     ) in github.events
     review_event = next(event for event in github.events if event[0] == "submit_review")
     assert review_event[1:3] == ("head-sha", ReviewEvent.COMMENT)
+    assert str(review_event[3]).startswith("## 🤖 Poppy review")
     assert "could not complete" in str(review_event[3])
     assert "private diagnostic" not in str(review_event[3])
     assert github.events[-1][0:3] == (
