@@ -9,6 +9,7 @@ import pytest
 
 from poppy.application.review_cycle import (
     ChangedFile,
+    InlineReviewComment,
     PullRequestRef,
     PullRequestSnapshot,
     ReviewCycle,
@@ -59,8 +60,9 @@ class FakeGitHub:
         head_sha: str,
         event: ReviewEvent,
         body: str,
+        comments: tuple[InlineReviewComment, ...] = (),
     ) -> None:
-        self.events.append(("submit_review", head_sha, event, body))
+        self.events.append(("submit_review", head_sha, event, body, comments))
 
     async def finish_check(
         self,
@@ -168,9 +170,20 @@ async def test_review_cycle_publishes_labels_review_and_check() -> None:
         file_path="src/handler.py",
         line=18,
     )
+    summary_only_finding = Finding(
+        severity=Severity.MEDIUM,
+        title="Existing code concern",
+        explanation="The cited line is outside the pull-request diff.",
+        evidence="The model cited line 16.",
+        suggested_response="Review it separately.",
+        file_path="src/handler.py",
+        line=16,
+    )
     codex = FakeCodex(
         ReviewResult(
-            summary="One blocking issue was found.", risk=Severity.HIGH, findings=(finding,)
+            summary="One blocking issue was found.",
+            risk=Severity.HIGH,
+            findings=(summary_only_finding, finding),
         )
     )
     cycle = ReviewCycle(github=github, codex=codex, blocking_severity=Severity.HIGH)
@@ -183,6 +196,19 @@ async def test_review_cycle_publishes_labels_review_and_check() -> None:
     review_event = next(event for event in github.events if event[0] == "submit_review")
     assert review_event[1:3] == ("head-sha", ReviewEvent.REQUEST_CHANGES)
     assert "Missing authorization" in str(review_event[3])
+    assert "Existing code concern" in str(review_event[3])
+    assert review_event[4] == (
+        InlineReviewComment(
+            path="src/handler.py",
+            line=18,
+            body=(
+                "### 🟠 HIGH · Missing authorization\n\n"
+                "The new endpoint does not check the caller.\n\n"
+                "**Evidence:** The handler calls the service directly.\n\n"
+                "**Suggested fix:** Require the repository owner role."
+            ),
+        ),
+    )
     assert github.events[-1][0:3] == ("finish_check", 77, GateConclusion.FAILURE)
 
 
@@ -317,7 +343,7 @@ def pull_request_snapshot() -> PullRequestSnapshot:
                 path="src/handler.py",
                 additions=120,
                 deletions=12,
-                patch="@@ -1 +1 @@\n-old\n+new",
+                patch="@@ -17,2 +17,2 @@\n context\n-old\n+new",
             ),
         ),
     )

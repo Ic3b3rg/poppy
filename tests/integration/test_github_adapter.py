@@ -8,7 +8,12 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from poppy.adapters.github import GitHubAdapter
-from poppy.application.review_cycle import GitHubPort, PullRequestRef, ReviewRequest
+from poppy.application.review_cycle import (
+    GitHubPort,
+    InlineReviewComment,
+    PullRequestRef,
+    ReviewRequest,
+)
 from poppy.domain.review import GateConclusion, ReviewEvent
 
 RequestHandler = Callable[[httpx.Request], Coroutine[None, None, httpx.Response]]
@@ -187,6 +192,14 @@ async def test_submits_exact_commit_review_and_completes_check() -> None:
                 "commit_id": "head-sha",
                 "event": "APPROVE",
                 "body": "Looks good.",
+                "comments": [
+                    {
+                        "path": "src/example.py",
+                        "line": 12,
+                        "side": "RIGHT",
+                        "body": "### 🟡 MEDIUM · Handle the edge case",
+                    }
+                ],
             }
             return json_response(200, {"id": 88})
         if request.url.path == "/repos/Ic3b3rg/example/check-runs/77":
@@ -204,6 +217,13 @@ async def test_submits_exact_commit_review_and_completes_check() -> None:
             head_sha="head-sha",
             event=ReviewEvent.APPROVE,
             body="Looks good.",
+            comments=(
+                InlineReviewComment(
+                    path="src/example.py",
+                    line=12,
+                    body="### 🟡 MEDIUM · Handle the edge case",
+                ),
+            ),
         )
         await adapter.finish_check(
             pull_request_ref(),
@@ -213,6 +233,47 @@ async def test_submits_exact_commit_review_and_completes_check() -> None:
         )
 
     assert [request.method for request in requests] == ["POST", "POST", "PATCH"]
+
+
+@pytest.mark.asyncio
+async def test_retries_review_without_inline_comments_when_github_rejects_them() -> None:
+    review_payloads: list[dict[str, object]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/access_tokens"):
+            return installation_token_response()
+        if request.url.path == "/repos/Ic3b3rg/example/pulls/7/reviews":
+            review_payloads.append(json.loads(request.content))
+            if len(review_payloads) == 1:
+                return json_response(422, {"message": "Validation Failed"})
+            return json_response(200, {"id": 89})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    async with github_adapter(handler) as adapter:
+        await adapter.submit_review(
+            pull_request_ref(),
+            head_sha="head-sha",
+            event=ReviewEvent.REQUEST_CHANGES,
+            body="The full finding remains here.",
+            comments=(
+                InlineReviewComment(
+                    path="src/example.py",
+                    line=12,
+                    body="Inline finding.",
+                ),
+            ),
+        )
+
+    assert len(review_payloads) == 2
+    assert review_payloads[0]["comments"] == [
+        {
+            "path": "src/example.py",
+            "line": 12,
+            "side": "RIGHT",
+            "body": "Inline finding.",
+        }
+    ]
+    assert "comments" not in review_payloads[1]
 
 
 class AdapterContext:

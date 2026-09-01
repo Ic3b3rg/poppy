@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -11,6 +12,8 @@ from poppy.domain.review import (
     Severity,
     classify_change_size,
     decide_gate,
+    order_findings,
+    render_finding_comment,
     render_review,
 )
 
@@ -64,6 +67,13 @@ class ChangedFile:
 
 
 @dataclass(frozen=True, slots=True)
+class InlineReviewComment:
+    path: str
+    line: int
+    body: str
+
+
+@dataclass(frozen=True, slots=True)
 class PullRequestSnapshot:
     ref: PullRequestRef
     head_sha: str
@@ -111,6 +121,7 @@ class GitHubPort(Protocol):
         head_sha: str,
         event: ReviewEvent,
         body: str,
+        comments: tuple[InlineReviewComment, ...] = (),
     ) -> None: ...
 
     async def finish_check(
@@ -216,6 +227,7 @@ class ReviewCycle:
             head_sha=snapshot.head_sha,
             event=decision.review_event,
             body=body,
+            comments=_inline_review_comments(snapshot, result),
         )
         await self._github.finish_check(
             ref,
@@ -252,6 +264,7 @@ class ReviewCycle:
             head_sha=snapshot.head_sha,
             event=ReviewEvent.COMMENT,
             body=body,
+            comments=(),
         )
         await self._github.finish_check(
             ref,
@@ -286,3 +299,52 @@ def _matches_request(snapshot: PullRequestSnapshot, request: ReviewRequest) -> b
         and snapshot.base_ref == request.base_ref
         and snapshot.is_draft == request.is_draft
     )
+
+
+_HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+
+def _inline_review_comments(
+    snapshot: PullRequestSnapshot,
+    result: ReviewResult,
+) -> tuple[InlineReviewComment, ...]:
+    commentable_lines = {
+        changed_file.path: _right_side_lines(changed_file.patch)
+        for changed_file in snapshot.files
+    }
+    comments: list[InlineReviewComment] = []
+    for finding in order_findings(result.findings):
+        if finding.file_path is None or finding.line is None:
+            continue
+        if finding.line not in commentable_lines.get(finding.file_path, frozenset()):
+            continue
+        comments.append(
+            InlineReviewComment(
+                path=finding.file_path,
+                line=finding.line,
+                body=render_finding_comment(finding),
+            )
+        )
+    return tuple(comments)
+
+
+def _right_side_lines(patch: str | None) -> frozenset[int]:
+    if patch is None:
+        return frozenset()
+
+    lines: set[int] = set()
+    current_line: int | None = None
+    for patch_line in patch.splitlines():
+        header = _HUNK_HEADER.match(patch_line)
+        if header is not None:
+            current_line = int(header.group(1))
+            continue
+        if current_line is None or patch_line.startswith("\\"):
+            continue
+        if patch_line.startswith("-"):
+            continue
+        if patch_line.startswith(("+", " ")):
+            lines.add(current_line)
+            current_line += 1
+
+    return frozenset(lines)

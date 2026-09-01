@@ -234,6 +234,22 @@ def severity_marker(severity: Severity) -> str:
     return _SEVERITY_MARKER[severity]
 
 
+def render_finding_comment(finding: Finding) -> str:
+    title = escape(" ".join(finding.title.split()))
+    return "\n".join(
+        (
+            f"### {severity_marker(finding.severity)} "
+            f"{finding.severity.value.upper()} · {title}",
+            "",
+            finding.explanation,
+            "",
+            f"**Evidence:** {finding.evidence}",
+            "",
+            f"**Suggested fix:** {finding.suggested_response}",
+        )
+    )
+
+
 def _with_rerun_footer(lines: list[str]) -> str:
     lines.extend(
         [

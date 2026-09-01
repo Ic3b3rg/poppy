@@ -20,6 +20,7 @@ from poppy.adapters.codex_onboarding import CodexDeviceAuthorization
 from poppy.adapters.github_onboarding import GitHubAppCredentials, GitHubInstallation
 from poppy.application.review_cycle import (
     ChangedFile,
+    InlineReviewComment,
     PullRequestRef,
     PullRequestSnapshot,
     ReviewRequest,
@@ -822,8 +823,9 @@ class FakeGitHub:
         head_sha: str,
         event: ReviewEvent,
         body: str,
+        comments: tuple[InlineReviewComment, ...] = (),
     ) -> None:
-        self.events.append(("submit_review", head_sha, event, body))
+        self.events.append(("submit_review", head_sha, event, body, comments))
 
     async def finish_check(
         self,

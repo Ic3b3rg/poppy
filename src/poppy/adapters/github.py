@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 from poppy.application.review_cycle import (
     ChangedFile,
+    InlineReviewComment,
     PullRequestRef,
     PullRequestSnapshot,
     ReviewRequest,
@@ -194,14 +195,40 @@ class GitHubAdapter:
         head_sha: str,
         event: ReviewEvent,
         body: str,
+        comments: tuple[InlineReviewComment, ...] = (),
     ) -> None:
-        await self._installation_request(
+        payload: dict[str, Any] = {
+            "commit_id": head_sha,
+            "event": event.value,
+            "body": body,
+        }
+        if comments:
+            payload["comments"] = [
+                {
+                    "path": comment.path,
+                    "line": comment.line,
+                    "side": "RIGHT",
+                    "body": comment.body,
+                }
+                for comment in comments
+            ]
+
+        response = await self._installation_request(
             ref.installation_id,
             "POST",
             f"/repos/{ref.owner}/{ref.repository}/pulls/{ref.number}/reviews",
-            json={"commit_id": head_sha, "event": event.value, "body": body},
-            expected_statuses=(200,),
+            json=payload,
+            expected_statuses=(200, 422) if comments else (200,),
         )
+        if response.status_code == 422:
+            payload.pop("comments")
+            await self._installation_request(
+                ref.installation_id,
+                "POST",
+                f"/repos/{ref.owner}/{ref.repository}/pulls/{ref.number}/reviews",
+                json=payload,
+                expected_statuses=(200,),
+            )
 
     async def finish_check(
         self,
