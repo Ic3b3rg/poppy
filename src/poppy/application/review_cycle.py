@@ -3,7 +3,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 from poppy.domain.review import (
     GateConclusion,
@@ -18,6 +18,8 @@ from poppy.domain.review import (
 )
 
 logger = logging.getLogger(__name__)
+
+ReviewTrigger = Literal["automatic", "rerun"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +40,7 @@ class ReviewRequest:
     body: str
     base_ref: str
     is_draft: bool
+    trigger: ReviewTrigger = "automatic"
 
     @property
     def dedupe_key(self) -> str:
@@ -51,6 +54,7 @@ class ReviewRequest:
                 "body": self.body,
                 "base_ref": self.base_ref,
                 "is_draft": self.is_draft,
+                "rerun_delivery": self.delivery_id if self.trigger == "rerun" else None,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -159,6 +163,7 @@ class ReviewCycle:
             "repository_id": request.ref.repository_id,
             "pull_request": request.ref.number,
             "head_sha": request.head_sha,
+            "trigger": request.trigger,
         }
         logger.info("review cycle started", extra=log_context)
         check_run_id = await self._github.start_check(request)
@@ -248,11 +253,14 @@ class ReviewCycle:
             (
                 "## 🤖 Poppy review",
                 "",
-                f"**Commit:** `{snapshot.head_sha[:7]}`  ",
-                f"**Change size:** {change_size.name} ({snapshot.changed_lines} lines)  ",
-                "**Gate:** Action required",
+                (
+                    f"> ⚠️ **Action required** · Size {change_size.name} "
+                    f"({snapshot.changed_lines} lines) · Commit `{snapshot.head_sha[:7]}`"
+                ),
                 "",
-                "Poppy could not complete this review. Retry the webhook delivery.",
+                "Poppy could not complete this review.",
+                "",
+                "Apply the `poppy:rerun` label to try the latest commit again.",
             )
         )
         await self._github.replace_poppy_labels(

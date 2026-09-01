@@ -16,7 +16,7 @@ from poppy.application.review_cycle import (
     PullRequestSnapshot,
     ReviewRequest,
 )
-from poppy.domain.review import GateConclusion, ReviewEvent
+from poppy.domain.review import RERUN_LABEL, GateConclusion, ReviewEvent
 
 GITHUB_API_VERSION = "2026-03-10"
 CHECK_NAME = "Poppy / PR Review"
@@ -170,7 +170,7 @@ class GitHubAdapter:
             if label.name.startswith("poppy:") and label.name not in desired
         }
 
-        for label in labels:
+        for label in (*labels, RERUN_LABEL):
             await self._ensure_label(ref, label)
         for label in stale:
             encoded = quote(label, safe="")
@@ -321,7 +321,7 @@ class GitHubAdapter:
             json={
                 "name": label,
                 "color": _label_color(label),
-                "description": "Managed automatically by Poppy.",
+                "description": _label_description(label),
             },
             expected_statuses=(201,),
         )
@@ -420,4 +420,12 @@ def _label_color(label: str) -> str:
         return "D73A4A"
     if label == "poppy:action-required":
         return "FBCA04"
+    if label == RERUN_LABEL:
+        return "1D76DB"
     return "5319E7"
+
+
+def _label_description(label: str) -> str:
+    if label == RERUN_LABEL:
+        return "Apply this label to rerun Poppy on the latest commit."
+    return "Managed automatically by Poppy."

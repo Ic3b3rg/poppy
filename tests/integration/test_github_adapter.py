@@ -129,6 +129,7 @@ async def test_fetch_pull_request_paginates_and_bounds_patches() -> None:
 @pytest.mark.asyncio
 async def test_replaces_only_poppy_labels_and_creates_missing_label() -> None:
     requests: list[httpx.Request] = []
+    created_labels: list[dict[str, object]] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
@@ -148,9 +149,11 @@ async def test_replaces_only_poppy_labels_and_creates_missing_label() -> None:
             return json_response(404, {"message": "Not Found"})
         if path == "/repos/Ic3b3rg/example/labels/poppy:blocked":
             return json_response(200, {"name": "poppy:blocked"})
+        if path == "/repos/Ic3b3rg/example/labels/poppy:rerun":
+            return json_response(404, {"message": "Not Found"})
         if path == "/repos/Ic3b3rg/example/labels" and request.method == "POST":
             payload = json.loads(request.content)
-            assert payload["name"] == "poppy:size/s"
+            created_labels.append(payload)
             return json_response(201, payload)
         if path in {
             "/repos/Ic3b3rg/example/issues/7/labels/poppy:size/xs",
@@ -177,6 +180,58 @@ async def test_replaces_only_poppy_labels_and_creates_missing_label() -> None:
         "/repos/Ic3b3rg/example/issues/7/labels/poppy:passed",
     }
     assert all(not path.endswith("/bug") for path in deleted_paths)
+    assert created_labels == [
+        {
+            "name": "poppy:size/s",
+            "color": "5319E7",
+            "description": "Managed automatically by Poppy.",
+        },
+        {
+            "name": "poppy:rerun",
+            "color": "1D76DB",
+            "description": "Apply this label to rerun Poppy on the latest commit.",
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_completed_review_removes_applied_rerun_label() -> None:
+    deleted_labels: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/access_tokens"):
+            return installation_token_response()
+        if path == "/repos/Ic3b3rg/example/issues/7/labels" and request.method == "GET":
+            return json_response(
+                200,
+                [
+                    {"name": "poppy:size/s"},
+                    {"name": "poppy:blocked"},
+                    {"name": "poppy:rerun"},
+                ],
+            )
+        if path.startswith("/repos/Ic3b3rg/example/labels/"):
+            return json_response(200, {"name": path.rsplit("/", 1)[-1]})
+        if request.method == "DELETE":
+            deleted_labels.append(path)
+            return httpx.Response(204)
+        if path == "/repos/Ic3b3rg/example/issues/7/labels" and request.method == "POST":
+            assert json.loads(request.content) == {
+                "labels": ["poppy:size/s", "poppy:blocked"]
+            }
+            return json_response(200, [])
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    async with github_adapter(handler) as adapter:
+        await adapter.replace_poppy_labels(
+            pull_request_ref(),
+            ("poppy:size/s", "poppy:blocked"),
+        )
+
+    assert deleted_labels == [
+        "/repos/Ic3b3rg/example/issues/7/labels/poppy:rerun"
+    ]
 
 
 @pytest.mark.asyncio

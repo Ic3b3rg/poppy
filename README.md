@@ -2,7 +2,8 @@
 
 Poppy is a personal GitHub App that automatically reviews every pull request in the
 repositories where you install it. It adds Change Size and gate labels, publishes one formal
-review, and completes a `Poppy / PR Review` Check Run.
+review with inline findings where GitHub can anchor them, and completes a
+`Poppy / PR Review` Check Run.
 
 Poppy can approve or request changes. It cannot merge, push, close, or edit a pull request.
 It runs on your server and uses your ChatGPT subscription through the local Codex App Server;
@@ -14,6 +15,8 @@ there is no OpenAI API-key fallback.
 - reviews up to three independent PRs in parallel by default;
 - uses `gpt-5.6-luna` by default;
 - submits `APPROVE`, `REQUEST_CHANGES`, or a safe `COMMENT` for an incomplete review;
+- orders findings by severity and anchors them to changed lines when possible;
+- creates a `poppy:rerun` label that you can apply to review the latest commit again;
 - changes only labels prefixed with `poppy:`;
 - never checks out or executes PR code.
 

@@ -3,6 +3,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from html import escape
 
+RERUN_LABEL = "poppy:rerun"
+
 
 class Severity(StrEnum):
     LOW = "low"

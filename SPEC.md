@@ -1,13 +1,14 @@
 # Spec: Poppy v0
 
-Status: approved by the Operator on 2026-08-26.
+Status: approved by the Operator on 2026-08-26; review UX extension approved on 2026-09-01.
 
 ## Goal
 
 Poppy is a personal GitHub reviewer. Whenever a pull request is opened or updated in one of the Operator's selected repositories, Poppy automatically:
 
 1. reviews the change;
-2. publishes one GitHub review with a concise summary and concrete Findings;
+2. publishes one GitHub review with a concise summary and concrete Findings, anchored to changed
+   lines when GitHub accepts the location;
 3. adds one Change Size label and one result label;
 4. completes the `Poppy / PR Review` Check Run;
 5. approves a passing, ready pull request or requests changes when blocking Findings exist.
@@ -16,7 +17,9 @@ Poppy is always a reviewer. It never creates, edits, closes, or merges pull requ
 
 ## Simplicity Rule
 
-The v0 is one small service with one webhook endpoint and one review flow. Do not add a database, Redis, dashboard, issue workflow, autonomous coding, inline annotations, per-repository config, or extra infrastructure.
+The v0 is one small service with one webhook endpoint and one review flow. Do not add a database,
+Redis, dashboard, issue workflow, autonomous coding, per-repository config, or extra
+infrastructure. Inline annotations belong to the same formal review and do not add another flow.
 
 Use the simplest implementation that satisfies this spec. New capabilities require a later vertical slice.
 
@@ -29,8 +32,13 @@ The private GitHub App is installed only on repositories selected by the Operato
 - `synchronize`;
 - `ready_for_review`;
 - `edited` when title, body, or base changes.
+- `labeled` only when the applied label is exactly `poppy:rerun`.
 
 Each event starts a Review Cycle for the current head SHA and normalized PR input. Duplicate deliveries are ignored in memory. Different pull requests may be reviewed concurrently; default concurrency is three.
+
+Automatic events with the same normalized PR state remain deduplicated. Each distinct
+`poppy:rerun` delivery is an explicit request to review that same latest state again; a duplicate
+delivery remains deduplicated.
 
 If Poppy is switched off, it does nothing. Missed deliveries can be redelivered from GitHub after it is switched on again. Automatic recovery is deliberately deferred.
 
@@ -44,13 +52,16 @@ If Poppy is switched off, it does nothing. Missed deliveries can be redelivered 
 6. Validate the result and deterministically decide the gate.
 7. Re-read the PR and discard the result if its head SHA or open/draft state changed.
 8. Add exactly one `poppy:size/*` label and one result label.
-9. Submit one formal GitHub review for the exact commit:
+9. Submit one formal GitHub review for the exact commit, including right-side inline comments for
+   Findings whose exact file and line are present in the bounded diff:
    - `APPROVE` when a ready PR has no blocking Findings;
    - `REQUEST_CHANGES` when a ready PR has blocking Findings;
    - `COMMENT` for a draft or an incomplete review.
+   If GitHub rejects an inline location, retry the same complete review without inline comments.
 10. Complete the Check Run as `success`, `failure`, or `action_required`.
 
-The formal review body is the single Poppy summary comment. Poppy does not create a second sticky issue comment.
+The formal review body keeps every Finding, including those also rendered inline, so the fallback
+is lossless. Poppy does not create a second sticky issue comment.
 
 ## AI Runtime
 
@@ -73,6 +84,9 @@ The validated review contains:
 
 `high` and `critical` Findings block by default. Invalid output, missing required patches, model failure, timeout, or stale state never produces an approval and completes as `action_required` where applicable.
 
+The review renders Findings in `critical`, `high`, `medium`, `low` order with red, orange, yellow,
+and blue severity markers. A compact table is followed by expandable evidence and suggested fixes.
+
 ## Labels
 
 Poppy changes only labels prefixed with `poppy:`.
@@ -82,6 +96,9 @@ Result labels:
 - `poppy:passed`;
 - `poppy:blocked`;
 - `poppy:action-required`.
+
+Poppy also ensures the repository has a `poppy:rerun` label. Applying it triggers a Review Cycle
+for the latest PR state; completion removes it from the PR so it can be applied again.
 
 Change Size uses additions plus deletions:
 
@@ -126,8 +143,12 @@ Do not grant `Contents: write`. GitHub requires that permission to merge, provid
 
 - Installing the App on two selected repositories requires no workflow file in either repository.
 - Opening a PR or pushing a new commit automatically starts a review.
+- Applying `poppy:rerun` starts another review of the latest commit and duplicate webhook
+  deliveries do not start duplicate work.
 - Three independent PRs can be reviewed concurrently.
 - A current ready PR receives exactly one formal Poppy review for that Review Cycle, the correct labels, and a completed Check Run.
+- Findings are ordered by severity and use inline review comments only for valid right-side diff
+  locations; the full review still succeeds without inline comments when GitHub rejects them.
 - Ten changed lines map to `XXS`; one thousand map to `XXL`.
 - Passing reviews approve; blocking reviews request changes; drafts and technical failures never approve.
 - A stale Review Cycle cannot publish a result for an older SHA.

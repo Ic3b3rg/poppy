@@ -79,12 +79,18 @@ from the App's GitHub installation settings without reconfiguring Poppy.
 
    - labels include `poppy:size/xs` and exactly one result label, either `poppy:passed` or
      `poppy:blocked`;
+   - the repository label picker includes `poppy:rerun`;
    - the pull request conversation contains one Poppy **Formal Review** for that event;
+   - Findings are ordered by severity and valid diff locations appear as inline comments;
    - **Checks** shows `Poppy / PR Review` completed, with success or failure matching the result
      label.
 
 Poppy may approve, request changes, or leave a safe comment. It never merges the pull request.
 The other Change Size ranges are documented in the project [README](../README.md#review-policy).
+
+To rerun the proof without changing code, apply `poppy:rerun` to the pull request. Verify that a
+new Review Cycle runs on the current head commit and that Poppy removes the trigger label when the
+review completes, making it available for another rerun.
 
 Record only the Poppy commit SHA, disposable pull-request URL, observed labels, review event, check
 conclusion, and test timestamps. Never record the setup link, device code, App key, webhook secret,
