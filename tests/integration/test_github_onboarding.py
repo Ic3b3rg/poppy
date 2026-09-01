@@ -11,6 +11,7 @@ import jwt
 import pytest
 from cryptography.hazmat.primitives import serialization
 
+from poppy.adapters.github_onboarding import GitHubAppCredentials, GitHubOnboarding
 from poppy.service import RuntimeConfigurationError, create_service
 from tests.onboarding_support import (
     establish_setup_session,
@@ -716,11 +717,51 @@ def test_malformed_or_impossible_github_setup_state_fails_closed(
 
 
 @pytest.mark.asyncio
+async def test_installation_identity_survives_a_github_app_rename() -> None:
+    private_key = github_private_key()
+
+    async def github(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/app/installations/456"
+        return httpx.Response(
+            200,
+            json={
+                "id": 456,
+                "app_id": 123,
+                "app_slug": "renamed-poppy",
+                "account": {
+                    "id": 789,
+                    "login": "operator",
+                    "type": "User",
+                },
+                "target_type": "User",
+                "repository_selection": "selected",
+                "suspended_at": None,
+            },
+        )
+
+    async with httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(github),
+    ) as client:
+        installation = await GitHubOnboarding(client=client).get_installation(
+            app=GitHubAppCredentials(
+                app_id=123,
+                slug="original-poppy",
+                private_key=private_key,
+                webhook_secret="generated-webhook-secret",
+            ),
+            installation_id=456,
+        )
+
+    assert installation.installation_id == 456
+    assert installation.account_login == "operator"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "invalid_fields",
     [
         {"app_id": 999},
-        {"app_slug": "unrelated-app"},
         {"target_type": "User"},
     ],
 )

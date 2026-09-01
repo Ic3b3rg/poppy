@@ -71,7 +71,6 @@ class _InstallationResponse(BaseModel):
 
     id: int = Field(gt=0)
     app_id: int = Field(gt=0)
-    app_slug: str = Field(min_length=1, max_length=100, pattern=r"^[a-z0-9-]+$")
     account: _InstallationAccount
     target_type: str = Field(min_length=1, max_length=40)
     repository_selection: Literal["all", "selected"]
@@ -143,7 +142,6 @@ class GitHubOnboarding:
         if (
             parsed.id != installation_id
             or parsed.app_id != app.app_id
-            or parsed.app_slug != app.slug
             or parsed.account.type != parsed.target_type
         ):
             raise GitHubOnboardingError("GitHub App installation does not belong to Poppy")

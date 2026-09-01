@@ -103,6 +103,7 @@ Poppy authenticates as the newly created App and verifies that the reported inst
 to that App before marking GitHub connected. A rejected or unavailable verification leaves the
 installation step retryable. Accepted credentials and installation identity are written atomically
 to `github-setup.json` with restrictive permissions, so the connected state survives restart.
+The stable App and installation IDs remain authoritative if the GitHub App is renamed later.
 Connecting GitHub alone does not finish onboarding: ChatGPT connection and final readiness are
 separate setup conditions.
 
