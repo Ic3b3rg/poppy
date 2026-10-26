@@ -4,8 +4,11 @@ import hmac
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from poppy.application.review_cycle import PullRequestRef, ReviewRequest
+from poppy.domain.review import RERUN_LABEL
 
-SUPPORTED_ACTIONS = frozenset({"opened", "reopened", "synchronize", "ready_for_review", "edited"})
+SUPPORTED_ACTIONS = frozenset(
+    {"opened", "reopened", "synchronize", "ready_for_review", "edited", "labeled"}
+)
 REVIEW_RELEVANT_EDITS = frozenset({"title", "body", "base"})
 
 
@@ -49,6 +52,11 @@ class _PullRequest(BaseModel):
     base: _Base
 
 
+class _Label(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    name: str = Field(min_length=1)
+
+
 class _PullRequestWebhook(BaseModel):
     model_config = ConfigDict(extra="ignore")
     action: str
@@ -57,6 +65,7 @@ class _PullRequestWebhook(BaseModel):
     repository: _Repository
     pull_request: _PullRequest
     changes: dict[str, object] = Field(default_factory=dict)
+    label: _Label | None = None
 
 
 def verify_signature(body: bytes, signature: str | None, secret: bytes) -> bool:
@@ -80,6 +89,8 @@ def normalize_pull_request_webhook(
         return None
     if payload.action == "edited" and not REVIEW_RELEVANT_EDITS.intersection(payload.changes):
         return None
+    if payload.action == "labeled" and (payload.label is None or payload.label.name != RERUN_LABEL):
+        return None
 
     return ReviewRequest(
         delivery_id=delivery_id,
@@ -95,4 +106,5 @@ def normalize_pull_request_webhook(
         body=payload.pull_request.body or "",
         base_ref=payload.pull_request.base.ref,
         is_draft=payload.pull_request.draft,
+        trigger="rerun" if payload.action == "labeled" else "automatic",
     )

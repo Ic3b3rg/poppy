@@ -1,0 +1,937 @@
+import asyncio
+import html
+import json
+import logging
+import re
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+import httpx
+import jwt
+import pytest
+from cryptography.hazmat.primitives import serialization
+
+from poppy.adapters.github_onboarding import GitHubAppCredentials, GitHubOnboarding
+from poppy.service import RuntimeConfigurationError, create_service
+from tests.onboarding_support import (
+    establish_setup_session,
+    github_private_key,
+    manifest_state_from,
+    setup_client,
+    setup_settings,
+)
+
+
+@pytest.mark.asyncio
+async def test_connect_github_starts_the_exact_private_app_manifest(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="poppy.service")
+    app = create_service(setup_settings(tmp_path))
+
+    async with setup_client(app) as client:
+        csrf_token = await establish_setup_session(client, caplog)
+        response = await client.post(
+            "/setup/github/connect",
+            data={"csrf_token": csrf_token},
+            headers={"origin": "https://poppy.example"},
+        )
+
+    assert response.status_code == 200
+    action = re.search(r'<form action="([^"]+)" method="post">', response.text)
+    manifest_input = re.search(
+        r'<input type="hidden" name="manifest" value="([^"]+)">',
+        response.text,
+    )
+    assert action is not None
+    assert manifest_input is not None
+    manifest_url = urlparse(html.unescape(action.group(1)))
+    manifest = json.loads(html.unescape(manifest_input.group(1)))
+
+    assert manifest_url.scheme == "https"
+    assert manifest_url.netloc == "github.com"
+    assert manifest_url.path == "/settings/apps/new"
+    manifest_state = parse_qs(manifest_url.query)["state"][0]
+    assert len(manifest_state) >= 43
+    app_name = manifest.pop("name")
+    assert isinstance(app_name, str)
+    assert re.fullmatch(r"Poppy [0-9a-f]{12}", app_name) is not None
+    assert manifest == {
+        "url": "https://poppy.example",
+        "hook_attributes": {
+            "url": "https://poppy.example/webhooks/github",
+            "active": True,
+        },
+        "redirect_url": "https://poppy.example/setup/github/manifest/callback",
+        "setup_url": "https://poppy.example/setup/github/installation",
+        "public": False,
+        "default_permissions": {
+            "checks": "write",
+            "pull_requests": "write",
+            "issues": "write",
+            "metadata": "read",
+        },
+        "default_events": ["pull_request"],
+    }
+    assert "https://github.com" in response.headers["content-security-policy"]
+
+
+@pytest.mark.asyncio
+async def test_connect_github_can_register_the_private_app_for_an_organization(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="poppy.service")
+    app = create_service(setup_settings(tmp_path))
+
+    async with setup_client(app) as client:
+        csrf_token = await establish_setup_session(client, caplog)
+        response = await client.post(
+            "/setup/github/connect",
+            data={"csrf_token": csrf_token, "organization": "operator-org"},
+            headers={"origin": "https://poppy.example"},
+        )
+
+    assert response.status_code == 200
+    action = re.search(r'<form action="([^"]+)" method="post">', response.text)
+    assert action is not None
+    manifest_url = urlparse(html.unescape(action.group(1)))
+    assert manifest_url.scheme == "https"
+    assert manifest_url.netloc == "github.com"
+    assert manifest_url.path == "/organizations/operator-org/settings/apps/new"
+    assert len(parse_qs(manifest_url.query)["state"][0]) >= 43
+
+
+@pytest.mark.asyncio
+async def test_repeated_connect_does_not_replace_the_active_manifest_state(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="poppy.service")
+    app = create_service(setup_settings(tmp_path))
+
+    async with setup_client(app) as client:
+        csrf_token = await establish_setup_session(client, caplog)
+        first = await client.post(
+            "/setup/github/connect",
+            data={"csrf_token": csrf_token, "organization": "operator-org"},
+            headers={"origin": "https://poppy.example"},
+        )
+        repeated = await client.post(
+            "/setup/github/connect",
+            data={"csrf_token": csrf_token, "organization": "operator-org"},
+            headers={"origin": "https://poppy.example"},
+        )
+
+    assert first.status_code == 200
+    assert repeated.status_code == 200
+    assert manifest_state_from(repeated) == manifest_state_from(first)
+    assert manifest_from(repeated)["name"] == manifest_from(first)["name"]
+    repeated_action = re.search(r'<form action="([^"]+)" method="post">', repeated.text)
+    assert repeated_action is not None
+    assert urlparse(html.unescape(repeated_action.group(1))).path == (
+        "/organizations/operator-org/settings/apps/new"
+    )
+
+
+@pytest.mark.asyncio
+async def test_connect_github_can_correct_an_unfinished_organization_target(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="poppy.service")
+    app = create_service(setup_settings(tmp_path))
+
+    async with setup_client(app) as client:
+        csrf_token = await establish_setup_session(client, caplog)
+        first = await client.post(
+            "/setup/github/connect",
+            data={"csrf_token": csrf_token, "organization": "wrong-org"},
+            headers={"origin": "https://poppy.example"},
+        )
+        setup_page = await client.get("/setup")
+        corrected = await client.post(
+            "/setup/github/connect",
+            data={"csrf_token": csrf_token, "organization": "operator-org"},
+            headers={"origin": "https://poppy.example"},
+        )
+        warning = await client.get("/setup")
+
+    first_app_name = manifest_from(first)["name"]
+    assert isinstance(first_app_name, str)
+    assert 'name="organization" value="wrong-org"' in setup_page.text
+    assert corrected.status_code == 200
+    assert manifest_state_from(corrected) != manifest_state_from(first)
+    corrected_action = re.search(r'<form action="([^"]+)" method="post">', corrected.text)
+    assert corrected_action is not None
+    assert urlparse(html.unescape(corrected_action.group(1))).path == (
+        "/organizations/operator-org/settings/apps/new"
+    )
+
+    assert first_app_name in warning.text
+    assert "delete" in warning.text.lower()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("organization", ["../operator", "-operator", "operator-", "x" * 40])
+async def test_connect_github_rejects_an_invalid_organization(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    organization: str,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="poppy.service")
+    app = create_service(setup_settings(tmp_path))
+
+    async with setup_client(app) as client:
+        csrf_token = await establish_setup_session(client, caplog)
+        response = await client.post(
+            "/setup/github/connect",
+            data={"csrf_token": csrf_token, "organization": organization},
+            headers={"origin": "https://poppy.example"},
+        )
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "invalid GitHub organization"}
+    assert not (tmp_path / "data" / "github-setup.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_connect_cannot_replace_a_manifest_exchange_in_progress(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    exchange_started = asyncio.Event()
+    finish_exchange = asyncio.Event()
+    private_key = github_private_key()
+
+    async def github(_request: httpx.Request) -> httpx.Response:
+        exchange_started.set()
+        await finish_exchange.wait()
+        return httpx.Response(
+            201,
+            json={
+                "id": 123,
+                "slug": "poppy-example",
+                "pem": private_key,
+                "webhook_secret": "generated-webhook-secret",
+            },
+        )
+
+    provider_client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(github),
+    )
+    caplog.set_level(logging.WARNING, logger="poppy.service")
+    app = create_service(
+        setup_settings(tmp_path),
+        github_onboarding_client=provider_client,
+    )
+
+    async with provider_client, setup_client(app) as client:
+        csrf_token = await establish_setup_session(client, caplog)
+        start = await client.post(
+            "/setup/github/connect",
+            data={"csrf_token": csrf_token, "organization": "operator-org"},
+            headers={"origin": "https://poppy.example"},
+        )
+        callback_task = asyncio.create_task(
+            client.get(
+                "/setup/github/manifest/callback",
+                params={"code": "manifest-code", "state": manifest_state_from(start)},
+            )
+        )
+        await exchange_started.wait()
+        repeated = await client.post(
+            "/setup/github/connect",
+            data={"csrf_token": csrf_token},
+            headers={"origin": "https://poppy.example"},
+        )
+        finish_exchange.set()
+        callback = await callback_task
+
+    assert repeated.status_code == 409
+    assert repeated.json() == {"error": "GitHub App registration is already in progress"}
+    assert callback.status_code == 303
+
+
+@pytest.mark.asyncio
+async def test_interrupted_manifest_exchange_is_retryable_after_restart(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    exchange_started = asyncio.Event()
+
+    async def interrupted_github(_request: httpx.Request) -> httpx.Response:
+        exchange_started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    configured = setup_settings(tmp_path)
+    provider_client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(interrupted_github),
+    )
+    caplog.set_level(logging.WARNING, logger="poppy.service")
+    app = create_service(configured, github_onboarding_client=provider_client)
+
+    async with provider_client, setup_client(app) as client:
+        csrf_token = await establish_setup_session(client, caplog)
+        session_cookie = client.cookies.get("poppy_setup_session")
+        start = await client.post(
+            "/setup/github/connect",
+            data={"csrf_token": csrf_token},
+            headers={"origin": "https://poppy.example"},
+        )
+        first_state = manifest_state_from(start)
+        first_app_name = manifest_from(start)["name"]
+        assert isinstance(first_app_name, str)
+        callback_task = asyncio.create_task(
+            client.get(
+                "/setup/github/manifest/callback",
+                params={"code": "manifest-code", "state": first_state},
+            )
+        )
+        await exchange_started.wait()
+        callback_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await callback_task
+
+    restarted_app = create_service(configured)
+    async with setup_client(restarted_app) as restarted_client:
+        restarted_client.cookies.set(
+            "poppy_setup_session",
+            session_cookie,
+            domain="poppy.example",
+            path="/setup",
+        )
+        warning = await restarted_client.get("/setup")
+        retry = await restarted_client.post(
+            "/setup/github/connect",
+            data={"csrf_token": csrf_token},
+            headers={"origin": "https://poppy.example"},
+        )
+
+    assert retry.status_code == 200
+    assert manifest_state_from(retry) != first_state
+    assert manifest_from(retry)["name"] != first_app_name
+    assert first_app_name in warning.text
+    assert "delete" in warning.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_manifest_callback_exchanges_once_and_redirects_without_exposing_credentials(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    requests: list[httpx.Request] = []
+    private_key = github_private_key()
+    webhook_secret = "generated-webhook-secret"
+
+    async def github(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.method == "POST"
+        assert request.url.path == "/app-manifests/manifest-code/conversions"
+        assert request.headers["accept"] == "application/vnd.github+json"
+        assert request.headers["x-github-api-version"] == "2026-03-10"
+        return httpx.Response(
+            201,
+            json={
+                "id": 123,
+                "slug": "poppy-example",
+                "pem": private_key,
+                "webhook_secret": webhook_secret,
+            },
+        )
+
+    provider_client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(github),
+    )
+    caplog.set_level(logging.WARNING, logger="poppy.service")
+    app = create_service(
+        setup_settings(tmp_path),
+        github_onboarding_client=provider_client,
+    )
+
+    async with provider_client, setup_client(app) as client:
+        csrf_token = await establish_setup_session(client, caplog)
+        start = await client.post(
+            "/setup/github/connect",
+            data={"csrf_token": csrf_token, "organization": "operator-org"},
+            headers={"origin": "https://poppy.example"},
+        )
+        state = manifest_state_from(start)
+        callback = await client.get(
+            "/setup/github/manifest/callback",
+            params={"code": "manifest-code", "state": state},
+        )
+        replay = await client.get(
+            "/setup/github/manifest/callback",
+            params={"code": "manifest-code", "state": state},
+        )
+
+    assert callback.status_code == 303
+    installation_url = urlparse(callback.headers["location"])
+    assert installation_url.scheme == "https"
+    assert installation_url.netloc == "github.com"
+    assert installation_url.path == "/apps/poppy-example/installations/new"
+    assert len(parse_qs(installation_url.query)["state"][0]) >= 43
+    assert replay.status_code == 404
+    assert len(requests) == 1
+    assert private_key not in callback.text
+    assert webhook_secret not in callback.text
+
+    state_file = tmp_path / "data" / "github-setup.json"
+    persisted = json.loads(state_file.read_text(encoding="utf-8"))
+    assert state_file.stat().st_mode & 0o777 == 0o600
+    assert persisted["app"] == {
+        "id": 123,
+        "slug": "poppy-example",
+        "private_key": private_key,
+        "webhook_secret": webhook_secret,
+    }
+
+
+@pytest.mark.asyncio
+async def test_manifest_callback_rejects_missing_invalid_and_ambiguous_correlation(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def unexpected_github_request(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected GitHub request: {request.method} {request.url}")
+
+    provider_client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(unexpected_github_request),
+    )
+    caplog.set_level(logging.WARNING, logger="poppy.service")
+    app = create_service(
+        setup_settings(tmp_path),
+        github_onboarding_client=provider_client,
+    )
+
+    async with provider_client, setup_client(app) as client:
+        csrf_token = await establish_setup_session(client, caplog)
+        start = await client.post(
+            "/setup/github/connect",
+            data={"csrf_token": csrf_token},
+            headers={"origin": "https://poppy.example"},
+        )
+        state = manifest_state_from(start)
+        missing_code = await client.get(
+            "/setup/github/manifest/callback",
+            params={"state": state},
+        )
+        missing_state = await client.get(
+            "/setup/github/manifest/callback",
+            params={"code": "manifest-code"},
+        )
+        invalid_state = await client.get(
+            "/setup/github/manifest/callback",
+            params={"code": "manifest-code", "state": "invalid"},
+        )
+        ambiguous_state = await client.get(
+            "/setup/github/manifest/callback",
+            params=[
+                ("code", "manifest-code"),
+                ("state", "invalid"),
+                ("state", state),
+            ],
+        )
+
+    assert [
+        missing_code.status_code,
+        missing_state.status_code,
+        invalid_state.status_code,
+        ambiguous_state.status_code,
+    ] == [404, 404, 404, 404]
+
+
+@pytest.mark.asyncio
+async def test_malformed_manifest_exchange_is_sanitized_and_retryable(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    private_key = github_private_key()
+    webhook_secret = "generated-webhook-secret"
+
+    async def github(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            201,
+            json={
+                "id": True,
+                "slug": "poppy-example",
+                "pem": private_key,
+                "webhook_secret": webhook_secret,
+            },
+        )
+
+    provider_client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(github),
+    )
+    caplog.set_level(logging.WARNING)
+    app = create_service(
+        setup_settings(tmp_path),
+        github_onboarding_client=provider_client,
+    )
+
+    async with provider_client, setup_client(app) as client:
+        csrf_token = await establish_setup_session(client, caplog)
+        first_start = await client.post(
+            "/setup/github/connect",
+            data={"csrf_token": csrf_token},
+            headers={"origin": "https://poppy.example"},
+        )
+        first_state = manifest_state_from(first_start)
+        first_app_name = manifest_from(first_start)["name"]
+        assert isinstance(first_app_name, str)
+        callback = await client.get(
+            "/setup/github/manifest/callback",
+            params={"code": "one-time-code", "state": first_state},
+        )
+        warning_before_retry = await client.get("/setup")
+        retry = await client.post(
+            "/setup/github/connect",
+            data={"csrf_token": csrf_token},
+            headers={"origin": "https://poppy.example"},
+        )
+        warning_after_retry = await client.get("/setup")
+
+    assert callback.status_code == 502
+    assert first_app_name in callback.json()["error"]
+    assert "delete" in callback.json()["error"].lower()
+    assert retry.status_code == 200
+    assert manifest_state_from(retry) != first_state
+    assert manifest_from(retry)["name"] != manifest_from(first_start)["name"]
+    assert first_app_name in warning_before_retry.text
+    assert first_app_name in warning_after_retry.text
+    assert "delete" in warning_before_retry.text.lower()
+    assert "delete" in warning_after_retry.text.lower()
+    persisted = json.loads((tmp_path / "data" / "github-setup.json").read_text(encoding="utf-8"))
+    assert persisted["phase"] == "manifest"
+    assert "app" not in persisted
+    assert private_key not in callback.text
+    assert webhook_secret not in callback.text
+    assert "one-time-code" not in caplog.text
+    assert private_key not in caplog.text
+    assert webhook_secret not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_installation_callback_verifies_the_new_app_and_survives_restart(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    private_key = github_private_key()
+    installation_requests: list[httpx.Request] = []
+
+    async def github(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/app-manifests/manifest-code/conversions":
+            return httpx.Response(
+                201,
+                json={
+                    "id": 123,
+                    "slug": "poppy-example",
+                    "pem": private_key,
+                    "webhook_secret": "generated-webhook-secret",
+                },
+            )
+        if request.url.path == "/app/installations/456":
+            installation_requests.append(request)
+            authorization = request.headers["authorization"]
+            assert authorization.startswith("Bearer ")
+            claims = jwt.decode(
+                authorization.removeprefix("Bearer "),
+                github_public_key(private_key),
+                algorithms=["RS256"],
+                options={"verify_exp": False, "verify_iat": False},
+            )
+            assert claims == {
+                "iat": 1_999_999_940,
+                "exp": 2_000_000_540,
+                "iss": "123",
+            }
+            assert request.headers["x-github-api-version"] == "2026-03-10"
+            return httpx.Response(
+                200,
+                json={
+                    "id": 456,
+                    "app_id": 123,
+                    "app_slug": "poppy-example",
+                    "account": {
+                        "id": 789,
+                        "login": "operator-org",
+                        "type": "Organization",
+                    },
+                    "target_type": "Organization",
+                    "repository_selection": "selected",
+                    "repositories": [{"id": 1, "full_name": "operator-org/managed-repository"}],
+                    "suspended_at": None,
+                },
+            )
+        raise AssertionError(f"unexpected GitHub request: {request.method} {request.url}")
+
+    configured = setup_settings(tmp_path)
+    provider_client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(github),
+    )
+    caplog.set_level(logging.WARNING, logger="poppy.service")
+    app = create_service(
+        configured,
+        clock=lambda: 2_000_000_000,
+        github_onboarding_client=provider_client,
+    )
+
+    async with provider_client, setup_client(app) as client:
+        csrf_token = await establish_setup_session(client, caplog)
+        start = await client.post(
+            "/setup/github/connect",
+            data={"csrf_token": csrf_token, "organization": "operator-org"},
+            headers={"origin": "https://poppy.example"},
+        )
+        session_cookie = client.cookies.get("poppy_setup_session")
+        client.cookies.clear()
+        manifest_callback = await client.get(
+            "/setup/github/manifest/callback",
+            params={"code": "manifest-code", "state": manifest_state_from(start)},
+        )
+        installation_state = parse_qs(urlparse(manifest_callback.headers["location"]).query)[
+            "state"
+        ][0]
+        installation_callback = await client.get(
+            "/setup/github/installation",
+            params={"installation_id": "456", "state": installation_state},
+        )
+        replay = await client.get(
+            "/setup/github/installation",
+            params={"installation_id": "456", "state": installation_state},
+        )
+        client.cookies.set(
+            "poppy_setup_session",
+            session_cookie,
+            domain="poppy.example",
+            path="/setup",
+        )
+        connected_page = await client.get("/setup")
+
+    assert installation_callback.status_code == 303
+    assert installation_callback.headers["location"] == "/setup"
+    assert replay.status_code == 404
+    assert len(installation_requests) == 1
+    assert "GitHub" in connected_page.text
+    assert "Connected" in connected_page.text
+    assert "Connect GitHub" not in connected_page.text
+    assert private_key not in connected_page.text
+    assert "generated-webhook-secret" not in connected_page.text
+    assert private_key not in caplog.text
+    assert "generated-webhook-secret" not in caplog.text
+
+    state_file = configured.data_dir / "github-setup.json"
+    persisted = json.loads(state_file.read_text(encoding="utf-8"))
+    assert persisted["phase"] == "connected"
+    assert persisted["installation"] == {
+        "id": 456,
+        "account_id": 789,
+        "account_login": "operator-org",
+        "target_type": "Organization",
+    }
+    assert "repositories" not in state_file.read_text(encoding="utf-8")
+
+    async def no_restart_request(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected restart request: {request.method} {request.url}")
+
+    restarted_provider = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(no_restart_request),
+    )
+    restarted_app = create_service(
+        configured,
+        clock=lambda: 2_000_000_000,
+        github_onboarding_client=restarted_provider,
+    )
+    async with restarted_provider, setup_client(restarted_app) as restarted_client:
+        restarted_client.cookies.set(
+            "poppy_setup_session",
+            session_cookie,
+            domain="poppy.example",
+            path="/setup",
+        )
+        restarted_page = await restarted_client.get("/setup")
+
+    assert restarted_page.status_code == 200
+    assert "Connected" in restarted_page.text
+
+
+@pytest.mark.parametrize(
+    "persisted_state",
+    [
+        {"version": True, "phase": "manifest", "manifest_state": "a" * 43},
+        {"version": 1, "phase": "manifest", "manifest_state": True},
+        {"version": 1, "phase": "exchange", "unexpected": "partial-secret"},
+        {
+            "version": 1,
+            "phase": "installation",
+            "app": {
+                "id": 123,
+                "slug": "poppy-example",
+                "private_key": "not-a-private-key",
+                "webhook_secret": "generated-webhook-secret",
+            },
+            "installation_state": "b" * 43,
+        },
+        {
+            "version": 1,
+            "phase": "connected",
+            "app": {
+                "id": True,
+                "slug": "poppy-example",
+                "private_key": "not-a-private-key",
+                "webhook_secret": "generated-webhook-secret",
+            },
+            "installation": {
+                "id": 456,
+                "account_id": 789,
+                "account_login": "operator-org",
+                "target_type": "Organization",
+                "repositories": ["operator-org/example"],
+            },
+        },
+    ],
+)
+def test_malformed_or_impossible_github_setup_state_fails_closed(
+    tmp_path: Path,
+    persisted_state: dict[str, object],
+) -> None:
+    configured = setup_settings(tmp_path)
+    configured.data_dir.mkdir(mode=0o700)
+    (configured.data_dir / "github-setup.json").write_text(
+        json.dumps(persisted_state),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeConfigurationError, match="setup state"):
+        create_service(configured)
+
+
+@pytest.mark.asyncio
+async def test_installation_identity_survives_a_github_app_rename() -> None:
+    private_key = github_private_key()
+
+    async def github(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/app/installations/456"
+        return httpx.Response(
+            200,
+            json={
+                "id": 456,
+                "app_id": 123,
+                "app_slug": "renamed-poppy",
+                "account": {
+                    "id": 789,
+                    "login": "operator",
+                    "type": "User",
+                },
+                "target_type": "User",
+                "repository_selection": "selected",
+                "suspended_at": None,
+            },
+        )
+
+    async with httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(github),
+    ) as client:
+        installation = await GitHubOnboarding(client=client).get_installation(
+            app=GitHubAppCredentials(
+                app_id=123,
+                slug="original-poppy",
+                private_key=private_key,
+                webhook_secret="generated-webhook-secret",
+            ),
+            installation_id=456,
+        )
+
+    assert installation.installation_id == 456
+    assert installation.account_login == "operator"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_fields",
+    [
+        {"app_id": 999},
+        {"target_type": "User"},
+    ],
+)
+async def test_unrelated_or_malformed_installation_is_retryable_and_never_connected(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    invalid_fields: dict[str, object],
+) -> None:
+    private_key = github_private_key()
+
+    async def github(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/app-manifests/"):
+            return httpx.Response(
+                201,
+                json={
+                    "id": 123,
+                    "slug": "poppy-example",
+                    "pem": private_key,
+                    "webhook_secret": "generated-webhook-secret",
+                },
+            )
+        if request.url.path == "/app/installations/456":
+            installation = {
+                "id": 456,
+                "app_id": 123,
+                "app_slug": "poppy-example",
+                "account": {
+                    "id": 789,
+                    "login": "operator-org",
+                    "type": "Organization",
+                },
+                "target_type": "Organization",
+                "repository_selection": "selected",
+                "suspended_at": None,
+            }
+            installation.update(invalid_fields)
+            return httpx.Response(
+                200,
+                json=installation,
+            )
+        raise AssertionError(f"unexpected GitHub request: {request.method} {request.url}")
+
+    provider_client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(github),
+    )
+    caplog.set_level(logging.WARNING, logger="poppy.service")
+    app = create_service(
+        setup_settings(tmp_path),
+        clock=lambda: 2_000_000_000,
+        github_onboarding_client=provider_client,
+    )
+
+    async with provider_client, setup_client(app) as client:
+        csrf_token = await establish_setup_session(client, caplog)
+        start = await client.post(
+            "/setup/github/connect",
+            data={"csrf_token": csrf_token, "organization": "operator-org"},
+            headers={"origin": "https://poppy.example"},
+        )
+        manifest_callback = await client.get(
+            "/setup/github/manifest/callback",
+            params={"code": "manifest-code", "state": manifest_state_from(start)},
+        )
+        installation_state = parse_qs(urlparse(manifest_callback.headers["location"]).query)[
+            "state"
+        ][0]
+        callback = await client.get(
+            "/setup/github/installation",
+            params={"installation_id": "456", "state": installation_state},
+        )
+        page = await client.get("/setup")
+
+    assert callback.status_code == 502
+    assert callback.json() == {
+        "error": "GitHub App installation could not be validated; retry from setup"
+    }
+    assert "Awaiting installation" in page.text
+    assert "Connected" not in page.text
+    persisted = json.loads((tmp_path / "data" / "github-setup.json").read_text(encoding="utf-8"))
+    assert persisted["phase"] == "installation"
+
+
+@pytest.mark.asyncio
+async def test_installation_callback_rejects_invalid_or_ambiguous_correlation(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    private_key = github_private_key()
+
+    async def github(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/app-manifests/"):
+            return httpx.Response(
+                201,
+                json={
+                    "id": 123,
+                    "slug": "poppy-example",
+                    "pem": private_key,
+                    "webhook_secret": "generated-webhook-secret",
+                },
+            )
+        raise AssertionError(f"unexpected installation request: {request.method} {request.url}")
+
+    provider_client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(github),
+    )
+    caplog.set_level(logging.WARNING, logger="poppy.service")
+    app = create_service(
+        setup_settings(tmp_path),
+        github_onboarding_client=provider_client,
+    )
+
+    async with provider_client, setup_client(app) as client:
+        csrf_token = await establish_setup_session(client, caplog)
+        start = await client.post(
+            "/setup/github/connect",
+            data={"csrf_token": csrf_token},
+            headers={"origin": "https://poppy.example"},
+        )
+        manifest_callback = await client.get(
+            "/setup/github/manifest/callback",
+            params={"code": "manifest-code", "state": manifest_state_from(start)},
+        )
+        state = parse_qs(urlparse(manifest_callback.headers["location"]).query)["state"][0]
+        missing_id = await client.get(
+            "/setup/github/installation",
+            params={"state": state},
+        )
+        missing_state = await client.get(
+            "/setup/github/installation",
+            params={"installation_id": "456"},
+        )
+        invalid_state = await client.get(
+            "/setup/github/installation",
+            params={"installation_id": "456", "state": "invalid"},
+        )
+        ambiguous_state = await client.get(
+            "/setup/github/installation",
+            params=[
+                ("installation_id", "456"),
+                ("state", "invalid"),
+                ("state", state),
+            ],
+        )
+        noncanonical_id = await client.get(
+            "/setup/github/installation",
+            params={"installation_id": "+456", "state": state},
+        )
+
+    assert [
+        missing_id.status_code,
+        missing_state.status_code,
+        invalid_state.status_code,
+        ambiguous_state.status_code,
+        noncanonical_id.status_code,
+    ] == [404, 404, 404, 404, 404]
+
+
+def manifest_from(response: httpx.Response) -> dict[str, object]:
+    manifest_input = re.search(
+        r'<input type="hidden" name="manifest" value="([^"]+)">',
+        response.text,
+    )
+    assert manifest_input is not None
+    manifest = json.loads(html.unescape(manifest_input.group(1)))
+    assert isinstance(manifest, dict)
+    return manifest
+
+
+def github_public_key(private_key: str) -> object:
+    loaded = serialization.load_pem_private_key(private_key.encode(), password=None)
+    return loaded.public_key()

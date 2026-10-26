@@ -1,6 +1,9 @@
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from html import escape
+
+RERUN_LABEL = "poppy:rerun"
 
 
 class Severity(StrEnum):
@@ -19,6 +22,13 @@ _SEVERITY_RANK = {
     Severity.MEDIUM: 1,
     Severity.HIGH: 2,
     Severity.CRITICAL: 3,
+}
+
+_SEVERITY_MARKER = {
+    Severity.LOW: "🔵",
+    Severity.MEDIUM: "🟡",
+    Severity.HIGH: "🟠",
+    Severity.CRITICAL: "🔴",
 }
 
 
@@ -145,40 +155,136 @@ def render_review(
         GateConclusion.FAILURE: "Blocked",
         GateConclusion.ACTION_REQUIRED: "Action required",
     }[decision.conclusion]
+    status_marker = {
+        GateConclusion.SUCCESS: "✅",
+        GateConclusion.FAILURE: "🔴",
+        GateConclusion.ACTION_REQUIRED: "⚠️",
+    }[decision.conclusion]
+    ordered = order_findings(result.findings)
     lines = [
-        "## 🌺 Poppy review",
+        "## 🤖 Poppy review",
         "",
-        f"**Commit:** `{head_sha[:7]}`  ",
-        f"**Change size:** {change_size.name} ({changed_lines} lines)  ",
-        f"**Risk:** {result.risk.value.title()}  ",
-        f"**Gate:** {status}",
+        (
+            f"> {status_marker} **{status}** · Risk **{result.risk.value.title()}**"
+            f" · Size {change_size.name} ({changed_lines} lines)"
+            f" · Commit `{head_sha[:7]}`"
+        ),
         "",
-        result.summary,
+        f"<p>{_render_plain_text(result.summary)}</p>",
         "",
         "### Findings",
     ]
 
-    if not result.findings:
-        lines.append("No concrete findings.")
-        return "\n".join(lines)
+    if not ordered:
+        lines.extend(["", "✅ No concrete findings."])
+        return _with_rerun_footer(lines)
 
-    for finding in result.findings:
+    lines.extend(
+        [
+            "",
+            "| Severity | Finding | Location |",
+            "| --- | --- | --- |",
+        ]
+    )
+
+    for finding in ordered:
+        marker = _SEVERITY_MARKER[finding.severity]
+        location = _render_location(finding)
+        rendered_location = (
+            f"<code>{_render_single_line(location)}</code>" if location is not None else "—"
+        )
+        lines.append(
+            "| "
+            f"{marker} **{finding.severity.value.upper()}** | "
+            f"{_escape_table_cell(finding.title)} | {rendered_location} |"
+        )
+
+    for finding in ordered:
+        marker = _SEVERITY_MARKER[finding.severity]
         location = _render_location(finding)
         lines.extend(
             [
                 "",
-                f"#### [{finding.severity.value.upper()}] {finding.title}",
-                *((f"`{location}`",) if location else ()),
+                "<details>",
+                (
+                    f"<summary>{marker} <strong>"
+                    f"{finding.severity.value.upper()}</strong> · "
+                    f"{_render_single_line(finding.title)}</summary>"
+                ),
                 "",
-                finding.explanation,
+                *(
+                    (
+                        "<p><strong>Location:</strong> "
+                        f"<code>{_render_single_line(location)}</code></p>",
+                        "",
+                    )
+                    if location
+                    else ()
+                ),
+                f"<p>{_render_plain_text(finding.explanation)}</p>",
                 "",
-                f"**Evidence:** {finding.evidence}",
+                (f"<p><strong>Evidence:</strong> {_render_plain_text(finding.evidence)}</p>"),
                 "",
-                f"**Suggested response:** {finding.suggested_response}",
+                (
+                    "<p><strong>Suggested fix:</strong> "
+                    f"{_render_plain_text(finding.suggested_response)}</p>"
+                ),
+                "",
+                "</details>",
             ]
         )
 
+    return _with_rerun_footer(lines)
+
+
+def order_findings(findings: Sequence[Finding]) -> tuple[Finding, ...]:
+    return tuple(sorted(findings, key=lambda finding: finding.severity.rank, reverse=True))
+
+
+def severity_marker(severity: Severity) -> str:
+    return _SEVERITY_MARKER[severity]
+
+
+def render_finding_comment(finding: Finding) -> str:
+    title = _render_single_line(finding.title)
+    return "\n".join(
+        (
+            f"### {severity_marker(finding.severity)} {finding.severity.value.upper()} · {title}",
+            "",
+            f"<p>{_render_plain_text(finding.explanation)}</p>",
+            "",
+            (f"<p><strong>Evidence:</strong> {_render_plain_text(finding.evidence)}</p>"),
+            "",
+            (
+                "<p><strong>Suggested fix:</strong> "
+                f"{_render_plain_text(finding.suggested_response)}</p>"
+            ),
+        )
+    )
+
+
+def _with_rerun_footer(lines: list[str]) -> str:
+    lines.extend(
+        [
+            "",
+            "---",
+            "Apply the `poppy:rerun` label to review the latest commit again.",
+        ]
+    )
     return "\n".join(lines)
+
+
+def _escape_table_cell(value: str) -> str:
+    return _render_single_line(value).replace("|", "&#124;")
+
+
+def _render_single_line(value: str) -> str:
+    return escape(" ".join(value.split()))
+
+
+def _render_plain_text(value: str) -> str:
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n")
+    return escape(normalized).replace("\n", "<br>\n")
 
 
 def _render_location(finding: Finding) -> str | None:

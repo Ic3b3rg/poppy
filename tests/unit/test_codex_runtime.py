@@ -29,6 +29,8 @@ def test_codex_config_uses_private_home_and_disables_api_key_and_external_tools(
         "CODEX_HOME": str(tmp_path),
         "OPENAI_API_KEY": "",
     }
+    assert 'cli_auth_credentials_store="file"' in config.config_overrides
+    assert 'forced_login_method="chatgpt"' in config.config_overrides
     assert 'web_search="disabled"' in config.config_overrides
     assert "features.apps=false" in config.config_overrides
     assert "features.plugins=false" in config.config_overrides

@@ -48,3 +48,87 @@ def test_context_limit_cannot_remove_reserved_prompt_space(
 def test_private_key_must_be_a_readable_file(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="private key"):
         read_github_private_key(tmp_path / "missing.pem")
+
+
+@pytest.mark.parametrize(
+    "public_base_url",
+    [
+        "http://poppy.example",
+        "https://poppy.example/nested",
+        "https://poppy.example/?query=value",
+        "https://poppy.example/#fragment",
+        "https://operator:secret@poppy.example",
+    ],
+)
+def test_public_base_url_is_a_complete_https_origin(public_base_url: str) -> None:
+    with pytest.raises(ValidationError):
+        PoppySettings(public_base_url=public_base_url, _env_file=None)
+
+
+def test_empty_portable_url_falls_back_when_coolify_magic_is_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("POPPY_PUBLIC_BASE_URL", "")
+    monkeypatch.delenv("SERVICE_URL_POPPY", raising=False)
+    monkeypatch.delenv("SERVICE_URL_POPPY_8000", raising=False)
+
+    settings = PoppySettings(_env_file=None)
+
+    assert str(settings.public_base_url) == "https://localhost/"
+
+
+def test_coolify_generated_url_becomes_the_public_origin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("POPPY_PUBLIC_BASE_URL", raising=False)
+    monkeypatch.setenv("SERVICE_URL_POPPY", "https://poppy.example")
+    monkeypatch.setenv(
+        "SERVICE_URL_POPPY_8000",
+        "http://poppy.example:8000",
+    )
+
+    settings = PoppySettings(_env_file=None)
+
+    assert str(settings.public_base_url) == "https://poppy.example/"
+
+
+def test_portable_public_url_overrides_the_coolify_generated_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("POPPY_PUBLIC_BASE_URL", "https://portable.example")
+    monkeypatch.setenv("SERVICE_URL_POPPY", "https://coolify.example")
+    monkeypatch.setenv("SERVICE_URL_POPPY_8000", "https://coolify.example")
+
+    settings = PoppySettings(_env_file=None)
+
+    assert str(settings.public_base_url) == "https://portable.example/"
+
+
+def test_port_specific_coolify_url_remains_a_legacy_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("POPPY_PUBLIC_BASE_URL", raising=False)
+    monkeypatch.delenv("SERVICE_URL_POPPY", raising=False)
+    monkeypatch.setenv("SERVICE_URL_POPPY_8000", "https://legacy.example")
+
+    settings = PoppySettings(_env_file=None)
+
+    assert str(settings.public_base_url) == "https://legacy.example/"
+
+
+def test_partial_legacy_reviewer_credentials_are_rejected() -> None:
+    with pytest.raises(ValidationError, match="configured together"):
+        PoppySettings(github_app_id=123, _env_file=None)
+
+
+def test_legacy_reviewer_credentials_reuse_the_compose_pem_location() -> None:
+    settings = PoppySettings(
+        github_app_id=123,
+        github_webhook_secret=SecretStr("a-secret-that-is-long-enough"),
+        _env_file=None,
+    )
+
+    credentials = settings.reviewer_credentials()
+
+    assert credentials is not None
+    assert credentials.private_key_file == Path("/run/secrets/github_app_private_key")

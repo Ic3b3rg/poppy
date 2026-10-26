@@ -1,8 +1,9 @@
 import hashlib
 import json
 import logging
+import re
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 from poppy.domain.review import (
     GateConclusion,
@@ -11,10 +12,14 @@ from poppy.domain.review import (
     Severity,
     classify_change_size,
     decide_gate,
+    order_findings,
+    render_finding_comment,
     render_review,
 )
 
 logger = logging.getLogger(__name__)
+
+ReviewTrigger = Literal["automatic", "rerun"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +40,7 @@ class ReviewRequest:
     body: str
     base_ref: str
     is_draft: bool
+    trigger: ReviewTrigger = "automatic"
 
     @property
     def dedupe_key(self) -> str:
@@ -48,6 +54,7 @@ class ReviewRequest:
                 "body": self.body,
                 "base_ref": self.base_ref,
                 "is_draft": self.is_draft,
+                "rerun_delivery": self.delivery_id if self.trigger == "rerun" else None,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -61,6 +68,13 @@ class ChangedFile:
     additions: int
     deletions: int
     patch: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class InlineReviewComment:
+    path: str
+    line: int
+    body: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +125,7 @@ class GitHubPort(Protocol):
         head_sha: str,
         event: ReviewEvent,
         body: str,
+        comments: tuple[InlineReviewComment, ...] = (),
     ) -> None: ...
 
     async def finish_check(
@@ -148,6 +163,7 @@ class ReviewCycle:
             "repository_id": request.ref.repository_id,
             "pull_request": request.ref.number,
             "head_sha": request.head_sha,
+            "trigger": request.trigger,
         }
         logger.info("review cycle started", extra=log_context)
         check_run_id = await self._github.start_check(request)
@@ -216,6 +232,7 @@ class ReviewCycle:
             head_sha=snapshot.head_sha,
             event=decision.review_event,
             body=body,
+            comments=_inline_review_comments(snapshot, result),
         )
         await self._github.finish_check(
             ref,
@@ -234,13 +251,16 @@ class ReviewCycle:
         change_size = classify_change_size(snapshot.changed_lines)
         body = "\n".join(
             (
-                "## 🌺 Poppy review",
+                "## 🤖 Poppy review",
                 "",
-                f"**Commit:** `{snapshot.head_sha[:7]}`  ",
-                f"**Change size:** {change_size.name} ({snapshot.changed_lines} lines)  ",
-                "**Gate:** Action required",
+                (
+                    f"> ⚠️ **Action required** · Size {change_size.name} "
+                    f"({snapshot.changed_lines} lines) · Commit `{snapshot.head_sha[:7]}`"
+                ),
                 "",
-                "Poppy could not complete this review. Retry the webhook delivery.",
+                "Poppy could not complete this review.",
+                "",
+                "Apply the `poppy:rerun` label to try the latest commit again.",
             )
         )
         await self._github.replace_poppy_labels(
@@ -252,6 +272,7 @@ class ReviewCycle:
             head_sha=snapshot.head_sha,
             event=ReviewEvent.COMMENT,
             body=body,
+            comments=(),
         )
         await self._github.finish_check(
             ref,
@@ -286,3 +307,51 @@ def _matches_request(snapshot: PullRequestSnapshot, request: ReviewRequest) -> b
         and snapshot.base_ref == request.base_ref
         and snapshot.is_draft == request.is_draft
     )
+
+
+_HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+
+def _inline_review_comments(
+    snapshot: PullRequestSnapshot,
+    result: ReviewResult,
+) -> tuple[InlineReviewComment, ...]:
+    commentable_lines = {
+        changed_file.path: _right_side_lines(changed_file.patch) for changed_file in snapshot.files
+    }
+    comments: list[InlineReviewComment] = []
+    for finding in order_findings(result.findings):
+        if finding.file_path is None or finding.line is None:
+            continue
+        if finding.line not in commentable_lines.get(finding.file_path, frozenset()):
+            continue
+        comments.append(
+            InlineReviewComment(
+                path=finding.file_path,
+                line=finding.line,
+                body=render_finding_comment(finding),
+            )
+        )
+    return tuple(comments)
+
+
+def _right_side_lines(patch: str | None) -> frozenset[int]:
+    if patch is None:
+        return frozenset()
+
+    lines: set[int] = set()
+    current_line: int | None = None
+    for patch_line in patch.splitlines():
+        header = _HUNK_HEADER.match(patch_line)
+        if header is not None:
+            current_line = int(header.group(1))
+            continue
+        if current_line is None or patch_line.startswith("\\"):
+            continue
+        if patch_line.startswith("-"):
+            continue
+        if patch_line.startswith(("+", " ")):
+            lines.add(current_line)
+            current_line += 1
+
+    return frozenset(lines)

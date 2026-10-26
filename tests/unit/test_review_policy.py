@@ -179,7 +179,7 @@ def test_renders_one_concise_formal_review() -> None:
         head_sha="0123456789abcdef",
     )
 
-    assert "Poppy review" in body
+    assert body.startswith("## 🤖 Poppy review")
     assert "`0123456`" in body
     assert "XS (37 lines)" in body
     assert "High" in body
@@ -187,6 +187,98 @@ def test_renders_one_concise_formal_review() -> None:
     assert "Unvalidated redirect" in body
     assert "src/redirect.py:42" in body
     assert "Allow only trusted relative paths." in body
+
+
+def test_orders_and_formats_findings_by_severity() -> None:
+    findings = tuple(
+        Finding(
+            severity=severity,
+            title=title,
+            explanation=f"{title} explanation.",
+            evidence=f"{title} evidence.",
+            suggested_response=f"Fix {title.lower()}.",
+            file_path=f"src/{title.lower()}.py",
+            line=index,
+        )
+        for index, (severity, title) in enumerate(
+            (
+                (Severity.MEDIUM, "Medium"),
+                (Severity.CRITICAL, "Critical"),
+                (Severity.LOW, "Low"),
+                (Severity.HIGH, "High"),
+            ),
+            start=10,
+        )
+    )
+    result = ReviewResult(
+        summary="Findings need attention.",
+        risk=Severity.CRITICAL,
+        findings=findings,
+    )
+    decision = decide_gate(
+        result.findings,
+        blocking_severity=Severity.HIGH,
+        is_draft=False,
+        is_complete=True,
+    )
+
+    body = render_review(
+        result=result,
+        decision=decision,
+        change_size=ChangeSize.M,
+        changed_lines=321,
+        head_sha="0123456789abcdef",
+    )
+
+    critical = body.index("🔴 **CRITICAL**")
+    high = body.index("🟠 **HIGH**")
+    medium = body.index("🟡 **MEDIUM**")
+    low = body.index("🔵 **LOW**")
+    assert critical < high < medium < low
+    assert "| Severity | Finding | Location |" in body
+    assert body.count("<details>") == 4
+    assert "<strong>Evidence:</strong>" in body
+    assert "<strong>Suggested fix:</strong>" in body
+    assert "`poppy:rerun`" in body
+
+
+def test_escapes_untrusted_model_text_without_breaking_review_layout() -> None:
+    finding = Finding(
+        severity=Severity.CRITICAL,
+        title="Broken | title\n</summary><h1>Injected</h1>",
+        explanation="<script>alert('explanation')</script>\nStill relevant.",
+        evidence="<details>fake evidence</details>",
+        suggested_response="</details><h1>fake fix</h1>",
+        file_path="src/<unsafe>.py",
+        line=12,
+    )
+    result = ReviewResult(
+        summary="<h1>Injected summary</h1>\nSummary continues.",
+        risk=Severity.CRITICAL,
+        findings=(finding,),
+    )
+    decision = decide_gate(
+        result.findings,
+        blocking_severity=Severity.HIGH,
+        is_draft=False,
+        is_complete=True,
+    )
+
+    body = render_review(
+        result=result,
+        decision=decision,
+        change_size=ChangeSize.XS,
+        changed_lines=25,
+        head_sha="0123456789abcdef",
+    )
+
+    assert body.count("<details>") == 1
+    assert body.count("</details>") == 1
+    assert "<script>" not in body
+    assert "<h1>Injected" not in body
+    assert "&lt;script&gt;" in body
+    assert "&lt;/summary&gt;&lt;h1&gt;Injected&lt;/h1&gt;" in body
+    assert "Broken &#124; title" in body
 
 
 def test_renders_no_findings_without_empty_sections() -> None:

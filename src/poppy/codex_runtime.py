@@ -5,6 +5,8 @@ from openai_codex import AsyncCodex, CodexConfig
 from openai_codex.generated.v2_all import ChatgptAccount
 
 _HARDENED_CONFIG = (
+    'cli_auth_credentials_store="file"',
+    'forced_login_method="chatgpt"',
     'web_search="disabled"',
     "features.apps=false",
     "features.plugins=false",

@@ -8,7 +8,12 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from poppy.adapters.github import GitHubAdapter
-from poppy.application.review_cycle import GitHubPort, PullRequestRef, ReviewRequest
+from poppy.application.review_cycle import (
+    GitHubPort,
+    InlineReviewComment,
+    PullRequestRef,
+    ReviewRequest,
+)
 from poppy.domain.review import GateConclusion, ReviewEvent
 
 RequestHandler = Callable[[httpx.Request], Coroutine[None, None, httpx.Response]]
@@ -124,6 +129,7 @@ async def test_fetch_pull_request_paginates_and_bounds_patches() -> None:
 @pytest.mark.asyncio
 async def test_replaces_only_poppy_labels_and_creates_missing_label() -> None:
     requests: list[httpx.Request] = []
+    created_labels: list[dict[str, object]] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
@@ -143,9 +149,11 @@ async def test_replaces_only_poppy_labels_and_creates_missing_label() -> None:
             return json_response(404, {"message": "Not Found"})
         if path == "/repos/Ic3b3rg/example/labels/poppy:blocked":
             return json_response(200, {"name": "poppy:blocked"})
+        if path == "/repos/Ic3b3rg/example/labels/poppy:rerun":
+            return json_response(404, {"message": "Not Found"})
         if path == "/repos/Ic3b3rg/example/labels" and request.method == "POST":
             payload = json.loads(request.content)
-            assert payload["name"] == "poppy:size/s"
+            created_labels.append(payload)
             return json_response(201, payload)
         if path in {
             "/repos/Ic3b3rg/example/issues/7/labels/poppy:size/xs",
@@ -172,6 +180,91 @@ async def test_replaces_only_poppy_labels_and_creates_missing_label() -> None:
         "/repos/Ic3b3rg/example/issues/7/labels/poppy:passed",
     }
     assert all(not path.endswith("/bug") for path in deleted_paths)
+    assert created_labels == [
+        {
+            "name": "poppy:size/s",
+            "color": "5319E7",
+            "description": "Managed automatically by Poppy.",
+        },
+        {
+            "name": "poppy:rerun",
+            "color": "1D76DB",
+            "description": "Apply this label to rerun Poppy on the latest commit.",
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_completed_review_removes_applied_rerun_label() -> None:
+    deleted_labels: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/access_tokens"):
+            return installation_token_response()
+        if path == "/repos/Ic3b3rg/example/issues/7/labels" and request.method == "GET":
+            return json_response(
+                200,
+                [
+                    {"name": "poppy:size/s"},
+                    {"name": "poppy:blocked"},
+                    {"name": "poppy:rerun"},
+                ],
+            )
+        if path.startswith("/repos/Ic3b3rg/example/labels/"):
+            return json_response(200, {"name": path.rsplit("/", 1)[-1]})
+        if request.method == "DELETE":
+            deleted_labels.append(path)
+            return httpx.Response(204)
+        if path == "/repos/Ic3b3rg/example/issues/7/labels" and request.method == "POST":
+            assert json.loads(request.content) == {"labels": ["poppy:size/s", "poppy:blocked"]}
+            return json_response(200, [])
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    async with github_adapter(handler) as adapter:
+        await adapter.replace_poppy_labels(
+            pull_request_ref(),
+            ("poppy:size/s", "poppy:blocked"),
+        )
+
+    assert deleted_labels == ["/repos/Ic3b3rg/example/issues/7/labels/poppy:rerun"]
+
+
+@pytest.mark.asyncio
+async def test_label_creation_tolerates_another_review_winning_the_race() -> None:
+    rerun_reads = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal rerun_reads
+        path = request.url.path
+        if path.endswith("/access_tokens"):
+            return installation_token_response()
+        if path == "/repos/Ic3b3rg/example/issues/7/labels" and request.method == "GET":
+            return json_response(200, [])
+        if path in {
+            "/repos/Ic3b3rg/example/labels/poppy:size/s",
+            "/repos/Ic3b3rg/example/labels/poppy:blocked",
+        }:
+            return json_response(200, {"name": path.rsplit("/", 1)[-1]})
+        if path == "/repos/Ic3b3rg/example/labels/poppy:rerun":
+            rerun_reads += 1
+            if rerun_reads == 1:
+                return json_response(404, {"message": "Not Found"})
+            return json_response(200, {"name": "poppy:rerun"})
+        if path == "/repos/Ic3b3rg/example/labels" and request.method == "POST":
+            assert json.loads(request.content)["name"] == "poppy:rerun"
+            return json_response(422, {"message": "Validation Failed"})
+        if path == "/repos/Ic3b3rg/example/issues/7/labels" and request.method == "POST":
+            return json_response(200, [])
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    async with github_adapter(handler) as adapter:
+        await adapter.replace_poppy_labels(
+            pull_request_ref(),
+            ("poppy:size/s", "poppy:blocked"),
+        )
+
+    assert rerun_reads == 2
 
 
 @pytest.mark.asyncio
@@ -187,6 +280,14 @@ async def test_submits_exact_commit_review_and_completes_check() -> None:
                 "commit_id": "head-sha",
                 "event": "APPROVE",
                 "body": "Looks good.",
+                "comments": [
+                    {
+                        "path": "src/example.py",
+                        "line": 12,
+                        "side": "RIGHT",
+                        "body": "### 🟡 MEDIUM · Handle the edge case",
+                    }
+                ],
             }
             return json_response(200, {"id": 88})
         if request.url.path == "/repos/Ic3b3rg/example/check-runs/77":
@@ -204,6 +305,13 @@ async def test_submits_exact_commit_review_and_completes_check() -> None:
             head_sha="head-sha",
             event=ReviewEvent.APPROVE,
             body="Looks good.",
+            comments=(
+                InlineReviewComment(
+                    path="src/example.py",
+                    line=12,
+                    body="### 🟡 MEDIUM · Handle the edge case",
+                ),
+            ),
         )
         await adapter.finish_check(
             pull_request_ref(),
@@ -213,6 +321,47 @@ async def test_submits_exact_commit_review_and_completes_check() -> None:
         )
 
     assert [request.method for request in requests] == ["POST", "POST", "PATCH"]
+
+
+@pytest.mark.asyncio
+async def test_retries_review_without_inline_comments_when_github_rejects_them() -> None:
+    review_payloads: list[dict[str, object]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/access_tokens"):
+            return installation_token_response()
+        if request.url.path == "/repos/Ic3b3rg/example/pulls/7/reviews":
+            review_payloads.append(json.loads(request.content))
+            if len(review_payloads) == 1:
+                return json_response(422, {"message": "Validation Failed"})
+            return json_response(200, {"id": 89})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    async with github_adapter(handler) as adapter:
+        await adapter.submit_review(
+            pull_request_ref(),
+            head_sha="head-sha",
+            event=ReviewEvent.REQUEST_CHANGES,
+            body="The full finding remains here.",
+            comments=(
+                InlineReviewComment(
+                    path="src/example.py",
+                    line=12,
+                    body="Inline finding.",
+                ),
+            ),
+        )
+
+    assert len(review_payloads) == 2
+    assert review_payloads[0]["comments"] == [
+        {
+            "path": "src/example.py",
+            "line": 12,
+            "side": "RIGHT",
+            "body": "Inline finding.",
+        }
+    ]
+    assert "comments" not in review_payloads[1]
 
 
 class AdapterContext:

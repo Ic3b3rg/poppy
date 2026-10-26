@@ -24,7 +24,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         asyncio.run(_login())
         return
     if args.command == "serve":
-        settings = PoppySettings()  # type: ignore[call-arg]
+        settings = PoppySettings()
         app = create_service(settings)
         uvicorn.run(
             app,
@@ -32,6 +32,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             port=settings.listen_port,
             log_level=settings.log_level,
             workers=1,
+            access_log=False,
         )
         return
     raise RuntimeError("unreachable command")

@@ -11,11 +11,12 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 from poppy.application.review_cycle import (
     ChangedFile,
+    InlineReviewComment,
     PullRequestRef,
     PullRequestSnapshot,
     ReviewRequest,
 )
-from poppy.domain.review import GateConclusion, ReviewEvent
+from poppy.domain.review import RERUN_LABEL, GateConclusion, ReviewEvent
 
 GITHUB_API_VERSION = "2026-03-10"
 CHECK_NAME = "Poppy / PR Review"
@@ -169,7 +170,7 @@ class GitHubAdapter:
             if label.name.startswith("poppy:") and label.name not in desired
         }
 
-        for label in labels:
+        for label in (*labels, RERUN_LABEL):
             await self._ensure_label(ref, label)
         for label in stale:
             encoded = quote(label, safe="")
@@ -194,14 +195,40 @@ class GitHubAdapter:
         head_sha: str,
         event: ReviewEvent,
         body: str,
+        comments: tuple[InlineReviewComment, ...] = (),
     ) -> None:
-        await self._installation_request(
+        payload: dict[str, Any] = {
+            "commit_id": head_sha,
+            "event": event.value,
+            "body": body,
+        }
+        if comments:
+            payload["comments"] = [
+                {
+                    "path": comment.path,
+                    "line": comment.line,
+                    "side": "RIGHT",
+                    "body": comment.body,
+                }
+                for comment in comments
+            ]
+
+        response = await self._installation_request(
             ref.installation_id,
             "POST",
             f"/repos/{ref.owner}/{ref.repository}/pulls/{ref.number}/reviews",
-            json={"commit_id": head_sha, "event": event.value, "body": body},
-            expected_statuses=(200,),
+            json=payload,
+            expected_statuses=(200, 422) if comments else (200,),
         )
+        if response.status_code == 422:
+            payload.pop("comments")
+            await self._installation_request(
+                ref.installation_id,
+                "POST",
+                f"/repos/{ref.owner}/{ref.repository}/pulls/{ref.number}/reviews",
+                json=payload,
+                expected_statuses=(200,),
+            )
 
     async def finish_check(
         self,
@@ -279,25 +306,37 @@ class GitHubAdapter:
 
     async def _ensure_label(self, ref: PullRequestRef, label: str) -> None:
         encoded = quote(label, safe="")
+        label_path = f"/repos/{ref.owner}/{ref.repository}/labels/{encoded}"
         response = await self._installation_request(
             ref.installation_id,
             "GET",
-            f"/repos/{ref.owner}/{ref.repository}/labels/{encoded}",
+            label_path,
             expected_statuses=(200, 404),
         )
         if response.status_code == 200:
             return
-        await self._installation_request(
+        creation = await self._installation_request(
             ref.installation_id,
             "POST",
             f"/repos/{ref.owner}/{ref.repository}/labels",
             json={
                 "name": label,
                 "color": _label_color(label),
-                "description": "Managed automatically by Poppy.",
+                "description": _label_description(label),
             },
-            expected_statuses=(201,),
+            expected_statuses=(201, 422),
         )
+        if creation.status_code == 201:
+            return
+
+        confirmation = await self._installation_request(
+            ref.installation_id,
+            "GET",
+            label_path,
+            expected_statuses=(200, 404),
+        )
+        if confirmation.status_code != 200:
+            raise GitHubError("GitHub label creation could not be confirmed")
 
     async def _installation_request(
         self,
@@ -393,4 +432,12 @@ def _label_color(label: str) -> str:
         return "D73A4A"
     if label == "poppy:action-required":
         return "FBCA04"
+    if label == RERUN_LABEL:
+        return "1D76DB"
     return "5319E7"
+
+
+def _label_description(label: str) -> str:
+    if label == RERUN_LABEL:
+        return "Apply this label to rerun Poppy on the latest commit."
+    return "Managed automatically by Poppy."

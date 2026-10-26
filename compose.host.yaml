@@ -1,0 +1,4 @@
+services:
+  poppy:
+    ports:
+      - "127.0.0.1:${POPPY_HOST_PORT:-8000}:8000"

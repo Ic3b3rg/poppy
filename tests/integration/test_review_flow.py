@@ -9,6 +9,7 @@ import pytest
 
 from poppy.application.review_cycle import (
     ChangedFile,
+    InlineReviewComment,
     PullRequestRef,
     PullRequestSnapshot,
     ReviewCycle,
@@ -59,8 +60,9 @@ class FakeGitHub:
         head_sha: str,
         event: ReviewEvent,
         body: str,
+        comments: tuple[InlineReviewComment, ...] = (),
     ) -> None:
-        self.events.append(("submit_review", head_sha, event, body))
+        self.events.append(("submit_review", head_sha, event, body, comments))
 
     async def finish_check(
         self,
@@ -143,6 +145,34 @@ async def test_irrelevant_event_is_ignored() -> None:
 
 
 @pytest.mark.asyncio
+async def test_rerun_label_schedules_latest_pull_request_state() -> None:
+    secret = b"test-webhook-secret"
+    scheduler = FakeScheduler()
+    app = create_app(webhook_secret=secret, scheduler=scheduler)
+    body = json.dumps(webhook_payload(action="labeled", label="poppy:rerun")).encode()
+
+    response = await post_webhook(app, body, secret=secret)
+
+    assert response.status_code == 202
+    assert response.json() == {"status": "scheduled"}
+    assert scheduler.requests == [replace(review_request(), trigger="rerun")]
+
+
+@pytest.mark.asyncio
+async def test_unrelated_label_is_ignored() -> None:
+    secret = b"test-webhook-secret"
+    scheduler = FakeScheduler()
+    app = create_app(webhook_secret=secret, scheduler=scheduler)
+    body = json.dumps(webhook_payload(action="labeled", label="bug")).encode()
+
+    response = await post_webhook(app, body, secret=secret)
+
+    assert response.status_code == 202
+    assert response.json() == {"status": "ignored"}
+    assert scheduler.requests == []
+
+
+@pytest.mark.asyncio
 async def test_duplicate_review_is_reported_without_a_second_task() -> None:
     secret = b"test-webhook-secret"
     scheduler = FakeScheduler(accepts=False)
@@ -168,9 +198,20 @@ async def test_review_cycle_publishes_labels_review_and_check() -> None:
         file_path="src/handler.py",
         line=18,
     )
+    summary_only_finding = Finding(
+        severity=Severity.MEDIUM,
+        title="Existing code concern",
+        explanation="The cited line is outside the pull-request diff.",
+        evidence="The model cited line 16.",
+        suggested_response="Review it separately.",
+        file_path="src/handler.py",
+        line=16,
+    )
     codex = FakeCodex(
         ReviewResult(
-            summary="One blocking issue was found.", risk=Severity.HIGH, findings=(finding,)
+            summary="One blocking issue was found.",
+            risk=Severity.HIGH,
+            findings=(summary_only_finding, finding),
         )
     )
     cycle = ReviewCycle(github=github, codex=codex, blocking_severity=Severity.HIGH)
@@ -183,6 +224,21 @@ async def test_review_cycle_publishes_labels_review_and_check() -> None:
     review_event = next(event for event in github.events if event[0] == "submit_review")
     assert review_event[1:3] == ("head-sha", ReviewEvent.REQUEST_CHANGES)
     assert "Missing authorization" in str(review_event[3])
+    assert "Existing code concern" in str(review_event[3])
+    assert review_event[4] == (
+        InlineReviewComment(
+            path="src/handler.py",
+            line=18,
+            body=(
+                "### 🟠 HIGH · Missing authorization\n\n"
+                "<p>The new endpoint does not check the caller.</p>\n\n"
+                "<p><strong>Evidence:</strong> The handler calls the service "
+                "directly.</p>\n\n"
+                "<p><strong>Suggested fix:</strong> Require the repository owner "
+                "role.</p>"
+            ),
+        ),
+    )
     assert github.events[-1][0:3] == ("finish_check", 77, GateConclusion.FAILURE)
 
 
@@ -220,7 +276,9 @@ async def test_unavailable_review_publishes_action_required_without_diagnostic()
     ) in github.events
     review_event = next(event for event in github.events if event[0] == "submit_review")
     assert review_event[1:3] == ("head-sha", ReviewEvent.COMMENT)
+    assert str(review_event[3]).startswith("## 🤖 Poppy review")
     assert "could not complete" in str(review_event[3])
+    assert "`poppy:rerun`" in str(review_event[3])
     assert "private diagnostic" not in str(review_event[3])
     assert github.events[-1][0:3] == (
         "finish_check",
@@ -259,6 +317,28 @@ async def test_scheduler_deduplicates_and_limits_parallel_reviews() -> None:
 
     release.set()
     await scheduler.join()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_allows_explicit_reruns_but_deduplicates_each_delivery() -> None:
+    processed: list[ReviewRequest] = []
+
+    async def handler(request: ReviewRequest) -> None:
+        processed.append(request)
+
+    scheduler = InMemoryScheduler(handler=handler, concurrency=2, history_size=10)
+    automatic = review_request()
+    first_rerun = replace(automatic, delivery_id="rerun-1", trigger="rerun")
+    second_rerun = replace(automatic, delivery_id="rerun-2", trigger="rerun")
+
+    assert await scheduler.schedule(automatic) is True
+    assert await scheduler.schedule(automatic) is False
+    assert await scheduler.schedule(first_rerun) is True
+    assert await scheduler.schedule(first_rerun) is False
+    assert await scheduler.schedule(second_rerun) is True
+    await scheduler.join()
+
+    assert len(processed) == 3
 
 
 async def post_webhook(
@@ -316,14 +396,18 @@ def pull_request_snapshot() -> PullRequestSnapshot:
                 path="src/handler.py",
                 additions=120,
                 deletions=12,
-                patch="@@ -1 +1 @@\n-old\n+new",
+                patch="@@ -17,2 +17,2 @@\n context\n-old\n+new",
             ),
         ),
     )
 
 
-def webhook_payload(*, action: str = "opened") -> dict[str, object]:
-    return {
+def webhook_payload(
+    *,
+    action: str = "opened",
+    label: str | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
         "action": action,
         "number": 7,
         "installation": {"id": 123},
@@ -341,3 +425,6 @@ def webhook_payload(*, action: str = "opened") -> dict[str, object]:
             "base": {"ref": "main"},
         },
     }
+    if label is not None:
+        payload["label"] = {"name": label}
+    return payload
